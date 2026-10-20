@@ -1,6 +1,17 @@
-# rdma-pipe
+# rdma-pipe — SC-RDMA working copy
 
-Utilities to send data over RDMA networks (InfiniBand, RoCE).
+Utilities to transfer files over RDMA networks, currently focused on RoCEv2.
+
+## Code lineage and status
+
+This working copy is derived from [kig/rdma-pipe](https://github.com/kig/rdma-pipe), originally authored by **Ilmari Heikkinen**, and incorporates the RoCEv2/`libibverbs` implementation maintained in the [yuhong-zhong/rdma-pipe fork](https://github.com/yuhong-zhong/rdma-pipe). Credit and copyright notices for the upstream work remain applicable; see [`LICENSE`](LICENSE).
+
+The SC26-RDMA working copy adds further local changes, including diagnostic/error reporting, argument validation, and helpers for complete TCP reads/writes. These local changes have not yet undergone a complete code audit or a comprehensive test suite. The fact that a test transfer succeeded is not a claim that all code paths are correct.
+
+**Compatibility note:** the yuhong-zhong fork changes the low-level implementation and connection handshake compared with the original upstream version. Do not assume protocol or command-line compatibility between these versions. The low-level tools use a TCP connection for the QP handshake and `libibverbs` for RDMA data transfer; this implementation does not require `ibacm` for that handshake.
+
+**Benchmark note:** performance figures and benchmark descriptions inherited from the upstream README are historical results for the environments in which they were measured. They are not measurements of the SC26-RDMA working copy and must not be cited as results for this version.
+
 
 # Why would you want to use this?
 
@@ -40,15 +51,15 @@ live$ zfs send rpool/home@today | rdsend backup 1234 super_great
 sudo make install
 ```
 
-You need the rdmacm and libibverbs development libraries. The rdpipe utility also needs ruby.
+The low-level `rdsend` and `rdrecv` programs use `libibverbs` directly and use TCP for the QP handshake; this variant does not require `librdmacm` for that handshake. The `rdpipe` utility also needs Ruby. OpenMP support is used by the fork's build.
 
-On Ubuntu:
+On Ubuntu (package names may vary by release):
 
-    # apt install -y rdma-core librdmacm-dev ruby
+    sudo apt install -y libibverbs-dev libgomp1 ruby
 
-On CentOS 7:
+On CentOS/RHEL (package names may vary by release):
 
-    # yum install -y rdma-core-devel ruby
+    sudo yum install -y rdma-core-devel libgomp ruby
 
 # Uninstall
 
@@ -90,29 +101,29 @@ rdcp [-v] [-r] SRC DST
 
 ```bash
 rdsend [-v] HOST PORT KEY [FILE]
-# -v Print out the send bandwidth at the end.
+# -v prints transfer diagnostics and bandwidth/timing information.
+# If FILE is omitted, rdsend reads from stdin.
 ```
 
 ## rdrecv - Receive data over RDMA
 
+In this working copy, the output filename is required:
+
 ```bash
-rdrecv PORT KEY [FILE]
+rdrecv [-v] PORT KEY FILENAME
 ```
 
-To pipe data from hostA to hostB:
+To transfer a file from hostA to hostB:
+
 ```bash
-# First set up the receive server on hostB.
-# The arguments to rdrecv are port number and a secret key for the receive.
-#
-# Here we set up the server to listen on port 12345 with the key "secret_key".
+# On hostB: listen and write to the named destination file.
+rdrecv -v 12345 secret_key mycopy.txt
 
-[hostB] $ rdrecv 12345 secret_key > mycopy
-
-# Next we send the data from A to B.
-# The arguments to rdsend are the server, port, and the secret key.
-
-[hostA] $ rdsend hostB 12345 secret_key < myfile
+# On hostA: send the source file.
+rdsend -v hostB 12345 secret_key myfile.txt
 ```
+
+Start `rdrecv` first, then run `rdsend`. The sender and receiver must use the same key and compatible builds of this protocol. The receiver writes directly to the named file; the old upstream examples that redirect `rdrecv` stdout are not appropriate for this variant.
 
 The commands are best executed with rdrecv first, so that rdsend can connect on the first attempt. 
 
@@ -298,19 +309,11 @@ Bandwidth 5.329 GB/s
 
 ```
 
-# License
+# Attribution and license
 
-Copyright 2023 Ilmari Heikkinen
+- **Original project:** [kig/rdma-pipe](https://github.com/kig/rdma-pipe), Copyright © 2023 Ilmari Heikkinen.
+- **RoCEv2 implementation and fork:** [yuhong-zhong/rdma-pipe](https://github.com/yuhong-zhong/rdma-pipe), by Yuhong Zhong. The fork's implementation and documentation are acknowledged here; see the linked repository for its history and source attribution.
+- **SC26-RDMA working-copy changes:** local diagnostic, validation, and robustness changes made for experimental use. These changes are not represented as upstream changes by either original author.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-   http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+The upstream project is licensed under the **Apache License, Version 2.0**. This working copy retains Apache-2.0; the complete license text is provided in [`LICENSE`](LICENSE). Do not remove the original attribution or license text when redistributing the code. Apache-2.0 also requires modified files to carry prominent notices stating that they have been changed; add such notices to modified source files before distributing this working copy. This documentation is an attribution summary, not legal advice.
 
