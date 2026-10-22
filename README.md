@@ -129,6 +129,29 @@ The commands are best executed with rdrecv first, so that rdsend can connect on 
 
 If rdrecv is not up, rdsend tries to connect for ~10 seconds before timing out.
 
+### Tuning (environment variables)
+
+Sender (`rdsend`, sent to the receiver during the handshake):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `RDMA_BUF_SIZE` | 32 | Chunk size in MiB |
+| `RDMA_RING_SIZE` | 4 | Chunks in flight (2..8) |
+
+Receiver (`rdrecv`, zero-copy file path):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `RDRECV_WRITEBACK_LAG` | 8 | Start page-cache writeback of each chunk as it completes and wait for the chunk this many positions behind before ACKing. Bounds dirty memory and makes the sender run at disk speed. `0` disables (the whole file is flushed by the final `fdatasync`). |
+| `RDRECV_PREFAULT` | `ahead` | `ahead`: worker threads allocate destination pages and prefetch NIC translations ahead of the receive window. `upfront`: do it for the whole file before the transfer (reported as setup). `off`: let ODP fault pages in during the transfer. |
+| `RDRECV_PREFAULT_THREADS` | 8 | Prefault worker threads. |
+| `RDRECV_PREFAULT_AHEAD` | 64 | Maximum chunks prefaulted beyond the last completed one (`0` = unlimited). |
+
+With `-v`, both sides report the same transfer interval (from key
+verification to the end-of-stream sentinel); the receiver additionally
+reports setup, writeback backpressure, prefault stall, finalization
+(munmap/ftruncate/fdatasync) and transfer+persistence time.
+
 
 ## rdpipe
 
