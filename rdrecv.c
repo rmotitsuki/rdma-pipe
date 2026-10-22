@@ -542,15 +542,68 @@ int main(int argc, char *argv[]) {
       IBV_ACCESS_REMOTE_WRITE;
 
   /*
-   * Use On-Demand Paging for the file-backed MAP_SHARED receive mapping.
-   * The RDMA device and driver must support ODP.
+   * RDRECV_ODP = on (default) | off for the file-backed receive mapping.
+   *   on:  On-Demand Paging; the NIC faults destination pages in as it
+   *        writes (prefault below hides most of that cost).
+   *   off: classic pinned registration. Works for tmpfs/shmem (the kernel
+   *        refuses long-term pins of most disk-filesystem pages; then we
+   *        fall back to ODP). Pages are populated by worker threads first,
+   *        because pinning alone would fault 10 GiB in from one thread.
    */
+  int use_odp = file_map != NULL;
   if (file_map != NULL) {
-    mr_access |= IBV_ACCESS_ON_DEMAND;
+    const char *o = getenv("RDRECV_ODP");
+    if (o && (strcmp(o, "off") == 0 || strcmp(o, "0") == 0)) use_odp = 0;
+    else if (o && *o && strcmp(o, "on") != 0 && strcmp(o, "1") != 0) {
+      fprintf(stderr, "rdrecv: RDRECV_ODP must be on or off\n");
+      return EXIT_FAILURE;
+    }
   }
+  if (file_map != NULL && !use_odp) {
+    int nt = 8;
+    const char *t = getenv("RDRECV_PREFAULT_THREADS");
+    if (t && *t) nt = atoi(t);
+    if (nt < 1) nt = 1;
+    if (nt > 64) nt = 64;
+    struct prefault_ctx pp = {0};
+    pp.base = file_map; pp.chunks = data_slots; pp.buf_size = buf_size;
+    pp.ahead = 0; pp.advise_ok = 0;
+    pp.ready = calloc(data_slots ? data_slots : 1, 1);
+    if (!pp.ready) { fprintf(stderr, "rdrecv: out of memory\n"); return EXIT_FAILURE; }
+    TS("populate before pinning start");
+    double p0 = now_sec();
+    prefault_scratch(&pp);
+    pthread_t th[64];
+    int started = 0;
+    for (int i = 0; i < nt; ++i) {
+      if (pthread_create(&th[i], NULL, prefault_worker, &pp) != 0) break;
+      started++;
+    }
+    if (started == 0) prefault_worker(&pp);
+    for (int i = 0; i < started; ++i) pthread_join(th[i], NULL);
+    free(pp.ready);
+    if (verbose)
+      fprintf(stderr, "Populate before pinning: %.3f s (%d threads)%s\n",
+              now_sec() - p0, started ? started : 1,
+              pp.touch_fallback ? " [touch fallback]" : "");
+    TS("populate before pinning done");
+  }
+  if (use_odp) mr_access |= IBV_ACCESS_ON_DEMAND;
 
+  double mr0 = now_sec();
   struct ibv_mr *mr =
       ibv_reg_mr(pd, rdma_buf, rdma_buf_size, mr_access);
+  if (!mr && file_map != NULL && !use_odp) {
+    fprintf(stderr, "rdrecv: pinned registration of the destination failed (%s); "
+            "falling back to ODP\n", strerror(errno));
+    use_odp = 1;
+    mr_access |= IBV_ACCESS_ON_DEMAND;
+    mr0 = now_sec();
+    mr = ibv_reg_mr(pd, rdma_buf, rdma_buf_size, mr_access);
+  }
+  if (mr && verbose && file_map != NULL)
+    fprintf(stderr, "Destination MR: %s, registered in %.3f s\n",
+            use_odp ? "ODP" : "pinned", now_sec() - mr0);
 
   if (!mr) {
     fprintf(stderr,
@@ -590,6 +643,7 @@ int main(int argc, char *argv[]) {
     pf.pd = pd; pf.mr = mr; pf.advise_ok = 1; pf.ahead = 64;
     const char *a = getenv("RDRECV_PREFAULT_AHEAD");
     if (a && *a) pf.ahead = strtoull(a, NULL, 10);
+    if (!use_odp) pf_mode = PF_OFF;   /* already populated and pinned */
     if (pf_mode == PF_UPFRONT) pf.ahead = 0;
     /* Window + in-flight tickets must fit in the prefault distance or the
      * workers and the main loop would wait on each other. */
