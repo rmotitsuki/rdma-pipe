@@ -286,62 +286,75 @@ struct reader_ctx {
   uint32_t buf_size, nslots;
   uint64_t chunks, file_size;
   uint64_t *bytes;            /* per slot */
-  uint64_t ready;             /* chunks read (atomic) */
+  uint64_t *slot_seq;         /* per slot: chunk+1 once read (atomic) */
+  uint64_t next;              /* next chunk ticket (atomic) */
   uint64_t freed;             /* chunks whose slot may be reused (atomic) */
   int stop;                   /* atomic */
   int err;                    /* errno of a failed read (atomic), 0 = ok */
   uint64_t err_offset;
+  double busy_seconds;        /* summed read time over workers (under lock) */
+  uint64_t chunks_read;
+  pthread_mutex_t lock;
 };
 
+/* One full-chunk pread (O_DIRECT when possible) by the calling thread. */
 static int read_chunk(struct reader_ctx *rc, uint64_t chunk_seq, char *slot_buf,
                       uint64_t *bytes_out) {
   uint32_t buf_size = rc->buf_size;
   uint64_t offset = chunk_seq * (uint64_t)buf_size;
   uint64_t remaining = rc->file_size - offset;
-  uint64_t bytes = 0;
-  if (rc->direct_fd >= 0 && remaining < buf_size) {
-    /* O_DIRECT tail lengths may violate device alignment; use buffered I/O. */
-    size_t tail_bytes = 0;
-    if (pread_full_or_eof(rc->fd, slot_buf, (size_t)remaining,
-                          (off_t)offset, &tail_bytes) != 0)
-      return -1;
-    bytes = tail_bytes;
-  } else if (read_file_parallel(rc->direct_fd >= 0 ? rc->direct_fd : rc->fd,
-                                slot_buf, buf_size, offset,
-                                rc->direct_fd >= 0, &bytes) != 0) {
-    int direct_error = errno;
-    if (rc->direct_fd >= 0 &&
-        read_file_parallel(rc->fd, slot_buf, buf_size, offset, 0, &bytes) == 0) {
+  size_t want = remaining < buf_size ? (size_t)remaining : buf_size;
+  size_t got = 0;
+  int use_direct = rc->direct_fd >= 0 && want == buf_size;
+  if (use_direct) {
+    if (pread_full_or_eof(rc->direct_fd, slot_buf, want, (off_t)offset, &got) != 0 ||
+        got != want) {
+      int direct_error = errno;
       if (rc->verbose)
-        fprintf(stderr, "rdsend: O_DIRECT chunk read failed (%s); retried buffered\n",
-                strerror(direct_error));
-    } else {
-      return -1;
+        fprintf(stderr, "rdsend: O_DIRECT chunk read failed (%s); retrying buffered\n",
+                got != want ? "short read" : strerror(direct_error));
+      use_direct = 0;
     }
   }
-  if (bytes == 0 || bytes > buf_size) { errno = EIO; return -1; }
-  *bytes_out = bytes;
+  if (!use_direct &&
+      pread_full_or_eof(rc->fd, slot_buf, want, (off_t)offset, &got) != 0)
+    return -1;
+  if (got == 0 || got > buf_size) { errno = EIO; return -1; }
+  *bytes_out = got;
   return 0;
 }
 
+/* Reader workers take chunk tickets in order; each reads one whole chunk. */
 static void *reader_worker(void *arg) {
   struct reader_ctx *rc = arg;
-  for (uint64_t i = 0; i < rc->chunks; ++i) {
+  double busy = 0.0;
+  uint64_t nread = 0;
+  for (;;) {
+    uint64_t i = __atomic_fetch_add(&rc->next, 1, __ATOMIC_ACQ_REL);
+    if (i >= rc->chunks) break;
     while (i >= __atomic_load_n(&rc->freed, __ATOMIC_ACQUIRE) + rc->nslots) {
-      if (__atomic_load_n(&rc->stop, __ATOMIC_ACQUIRE)) return NULL;
+      if (__atomic_load_n(&rc->stop, __ATOMIC_ACQUIRE)) goto out;
       sched_yield();
     }
-    if (__atomic_load_n(&rc->stop, __ATOMIC_ACQUIRE)) return NULL;
+    if (__atomic_load_n(&rc->stop, __ATOMIC_ACQUIRE)) break;
     uint32_t slot = (uint32_t)(i % rc->nslots);
     uint64_t bytes = 0;
+    double t0 = now_sec();
     if (read_chunk(rc, i, rc->base + (size_t)slot * rc->buf_size, &bytes) != 0) {
       rc->err_offset = i * (uint64_t)rc->buf_size;
       __atomic_store_n(&rc->err, errno ? errno : EIO, __ATOMIC_RELEASE);
-      return NULL;
+      break;
     }
+    busy += now_sec() - t0;
+    nread++;
     rc->bytes[slot] = bytes;
-    __atomic_store_n(&rc->ready, i + 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&rc->slot_seq[slot], i + 1, __ATOMIC_RELEASE);
   }
+out:
+  pthread_mutex_lock(&rc->lock);
+  rc->busy_seconds += busy;
+  rc->chunks_read += nread;
+  pthread_mutex_unlock(&rc->lock);
   return NULL;
 }
 
@@ -769,17 +782,32 @@ int main(int argc, char *argv[]) {
       .fd = fd, .direct_fd = direct_fd, .verbose = verbose,
       .base = send_base, .buf_size = buf_size, .nslots = nslots,
       .chunks = chunks, .file_size = params.file_size,
+      .lock = PTHREAD_MUTEX_INITIALIZER,
     };
     rc.bytes = calloc(nslots, sizeof(*rc.bytes));
-    if (!rc.bytes) { fprintf(stderr, "rdsend: out of memory\n"); return EXIT_FAILURE; }
-    pthread_t reader;
-    if (pthread_create(&reader, NULL, reader_worker, &rc) != 0) {
-      fprintf(stderr, "rdsend: failed to start reader thread\n");
+    rc.slot_seq = calloc(nslots, sizeof(*rc.slot_seq));
+    if (!rc.bytes || !rc.slot_seq) { fprintf(stderr, "rdsend: out of memory\n"); return EXIT_FAILURE; }
+    /* RDSEND_READ_THREADS: parallel whole-chunk readers (default 8). */
+    int nreaders = 8;
+    const char *rt_env = getenv("RDSEND_READ_THREADS");
+    if (rt_env && *rt_env) nreaders = atoi(rt_env);
+    if (nreaders < 1) nreaders = 1;
+    if (nreaders > 64) nreaders = 64;
+    if ((uint32_t)nreaders > nslots) nreaders = (int)nslots;
+    pthread_t readers[64];
+    int nstarted = 0;
+    for (int i = 0; i < nreaders; ++i) {
+      if (pthread_create(&readers[i], NULL, reader_worker, &rc) != 0) break;
+      nstarted++;
+    }
+    if (nstarted == 0) {
+      fprintf(stderr, "rdsend: failed to start reader threads\n");
       return EXIT_FAILURE;
     }
     if (verbose)
-      fprintf(stderr, "Read-ahead: %u slots (%u MiB) beyond the %u-chunk window\n",
-              nslots - window, (nslots - window) * (buf_size / (1024U * 1024U)), window);
+      fprintf(stderr, "Read-ahead: %u slots (%u MiB) beyond the %u-chunk window, %d reader threads\n",
+              nslots - window, (nslots - window) * (buf_size / (1024U * 1024U)),
+              window, nstarted);
 
     total_bytes = 0;
     uint64_t posted = 0, sends_done = 0, acks_done = 0;
@@ -787,8 +815,8 @@ int main(int argc, char *argv[]) {
     int failed = 0;
     while (acks_done < chunks || sends_done < chunks) {
       /* Post every chunk that is read and fits in the window. */
-      uint64_t ready = __atomic_load_n(&rc.ready, __ATOMIC_ACQUIRE);
-      while (posted < chunks && posted - acks_done < window && posted < ready) {
+      while (posted < chunks && posted - acks_done < window &&
+             __atomic_load_n(&rc.slot_seq[posted % nslots], __ATOMIC_ACQUIRE) == posted + 1) {
         uint32_t slot = (uint32_t)(posted % nslots);
         uint64_t bytes = rc.bytes[slot];
         ack_sge.addr = (uintptr_t)(ack_base + (size_t)(posted % window) * 4U);
@@ -818,7 +846,7 @@ int main(int argc, char *argv[]) {
 
       /* Window has room but the next chunk is not read yet: disk-bound. */
       int starved = posted < chunks && posted - acks_done < window &&
-                    posted >= __atomic_load_n(&rc.ready, __ATOMIC_ACQUIRE);
+                    __atomic_load_n(&rc.slot_seq[posted % nslots], __ATOMIC_ACQUIRE) != posted + 1;
       if (starved && stall_start == 0.0) stall_start = now_sec();
       else if (!starved && stall_start != 0.0) {
         read_stall += now_sec() - stall_start;
@@ -858,12 +886,18 @@ int main(int argc, char *argv[]) {
     }
     if (stall_start != 0.0) read_stall += now_sec() - stall_start;
     __atomic_store_n(&rc.stop, 1, __ATOMIC_RELEASE);
-    pthread_join(reader, NULL);
+    for (int i = 0; i < nstarted; ++i) pthread_join(readers[i], NULL);
     free(rc.bytes);
+    free(rc.slot_seq);
     if (failed) return EXIT_FAILURE;
-    if (verbose)
+    if (verbose) {
       fprintf(stderr, "Read stall (window open, waiting on file read): %.3f s\n",
               read_stall);
+      if (rc.busy_seconds > 0)
+        fprintf(stderr, "Reader: %d threads, %.3f s busy in total, %.2f GB/s per thread\n",
+                nstarted, rc.busy_seconds,
+                (double)rc.chunks_read * buf_size / rc.busy_seconds / 1e9);
+    }
 
     /* End-of-stream sentinel remains ordered after all data sends. */
     ack_sge.addr = (uintptr_t)ack_base;
