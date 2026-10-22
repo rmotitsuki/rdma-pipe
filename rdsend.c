@@ -46,6 +46,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <omp.h>
+#include <pthread.h>
+#include <sched.h>
 
 #include <infiniband/verbs.h>
 
@@ -271,6 +273,78 @@ static int read_file_parallel(int fd, void *buf, uint32_t buf_size,
   return 0;
 }
 
+/*
+ * Read-ahead for the file path. A reader thread fills send slots ahead of the
+ * network so disk/NVMe-oF reads overlap with RDMA sends instead of
+ * alternating with them. There are `nslots` slots (window + read-ahead); the
+ * slot of chunk i is reused for chunk i + nslots once chunk i has been both
+ * send-completed and ACKed by the receiver.
+ */
+struct reader_ctx {
+  int fd, direct_fd, verbose;
+  char *base;
+  uint32_t buf_size, nslots;
+  uint64_t chunks, file_size;
+  uint64_t *bytes;            /* per slot */
+  uint64_t ready;             /* chunks read (atomic) */
+  uint64_t freed;             /* chunks whose slot may be reused (atomic) */
+  int stop;                   /* atomic */
+  int err;                    /* errno of a failed read (atomic), 0 = ok */
+  uint64_t err_offset;
+};
+
+static int read_chunk(struct reader_ctx *rc, uint64_t chunk_seq, char *slot_buf,
+                      uint64_t *bytes_out) {
+  uint32_t buf_size = rc->buf_size;
+  uint64_t offset = chunk_seq * (uint64_t)buf_size;
+  uint64_t remaining = rc->file_size - offset;
+  uint64_t bytes = 0;
+  if (rc->direct_fd >= 0 && remaining < buf_size) {
+    /* O_DIRECT tail lengths may violate device alignment; use buffered I/O. */
+    size_t tail_bytes = 0;
+    if (pread_full_or_eof(rc->fd, slot_buf, (size_t)remaining,
+                          (off_t)offset, &tail_bytes) != 0)
+      return -1;
+    bytes = tail_bytes;
+  } else if (read_file_parallel(rc->direct_fd >= 0 ? rc->direct_fd : rc->fd,
+                                slot_buf, buf_size, offset,
+                                rc->direct_fd >= 0, &bytes) != 0) {
+    int direct_error = errno;
+    if (rc->direct_fd >= 0 &&
+        read_file_parallel(rc->fd, slot_buf, buf_size, offset, 0, &bytes) == 0) {
+      if (rc->verbose)
+        fprintf(stderr, "rdsend: O_DIRECT chunk read failed (%s); retried buffered\n",
+                strerror(direct_error));
+    } else {
+      return -1;
+    }
+  }
+  if (bytes == 0 || bytes > buf_size) { errno = EIO; return -1; }
+  *bytes_out = bytes;
+  return 0;
+}
+
+static void *reader_worker(void *arg) {
+  struct reader_ctx *rc = arg;
+  for (uint64_t i = 0; i < rc->chunks; ++i) {
+    while (i >= __atomic_load_n(&rc->freed, __ATOMIC_ACQUIRE) + rc->nslots) {
+      if (__atomic_load_n(&rc->stop, __ATOMIC_ACQUIRE)) return NULL;
+      sched_yield();
+    }
+    if (__atomic_load_n(&rc->stop, __ATOMIC_ACQUIRE)) return NULL;
+    uint32_t slot = (uint32_t)(i % rc->nslots);
+    uint64_t bytes = 0;
+    if (read_chunk(rc, i, rc->base + (size_t)slot * rc->buf_size, &bytes) != 0) {
+      rc->err_offset = i * (uint64_t)rc->buf_size;
+      __atomic_store_n(&rc->err, errno ? errno : EIO, __ATOMIC_RELEASE);
+      return NULL;
+    }
+    rc->bytes[slot] = bytes;
+    __atomic_store_n(&rc->ready, i + 1, __ATOMIC_RELEASE);
+  }
+  return NULL;
+}
+
 /* Wait for one completion while using the completion channel safely. */
 static int wait_cq_completion(struct ibv_cq *cq,
                               struct ibv_comp_channel *channel,
@@ -461,12 +535,29 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  /* Pipelined send slots plus one 4-byte ACK receive area per slot. */
-  if (buf_size > (UINT32_MAX - params.ring_size * 4U) / params.ring_size) {
-    fprintf(stderr, "rdsend: RDMA buffer ring is too large\n");
+  /*
+   * Send slots: the in-flight window (ring_size) plus RDSEND_READ_AHEAD
+   * read-ahead slots (default ring_size) for regular files, followed by one
+   * 4-byte ACK receive area per window slot.
+   */
+  uint32_t read_ahead = params.ring_size;
+  const char *ra_env = getenv("RDSEND_READ_AHEAD");
+  if (ra_env && *ra_env) {
+    char *end = NULL;
+    long ra = strtol(ra_env, &end, 10);
+    if (*end != '\0' || ra < 0 || ra > 64) {
+      fprintf(stderr, "rdsend: invalid RDSEND_READ_AHEAD='%s' (expected 0..64)\n", ra_env);
+      return EXIT_FAILURE;
+    }
+    read_ahead = (uint32_t)ra;
+  }
+  uint32_t nslots = params.ring_size + (params.file_size > 0 ? read_ahead : 0);
+  if ((uint64_t)buf_size * nslots + params.ring_size * 4ULL > UINT32_MAX) {
+    fprintf(stderr, "rdsend: RDMA buffer ring is too large (%u slots of %u bytes)\n",
+            nslots, buf_size);
     return EXIT_FAILURE;
   }
-  buf_len = buf_size * params.ring_size + params.ring_size * 4U;
+  buf_len = buf_size * nslots + params.ring_size * 4U;
   buf = mmap(NULL, buf_len, PROT_READ | PROT_WRITE,
              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (buf == MAP_FAILED) { fprintf(stderr, "rdsend: mmap of %u-byte send buffer failed: %s\n", buf_len, strerror(errno)); return 113; }
@@ -625,7 +716,7 @@ int main(int argc, char *argv[]) {
     if (verbose) fprintf(stderr, "RDMA pipeline depth: %u chunks (%u MiB each)\n",
                          window, buf_size / (1024U * 1024U));
     char *send_base = (char *)buf;
-    char *ack_base = send_base + (size_t)window * buf_size;
+    char *ack_base = send_base + (size_t)nslots * buf_size;
     uint64_t chunks = params.file_size / buf_size +
                       ((params.file_size % buf_size) != 0);
 
@@ -667,86 +758,112 @@ int main(int argc, char *argv[]) {
     transfer_start = now_sec();
     last_report_time = transfer_start;
 
+    /*
+     * Sliding window: chunk k is posted as soon as it has been read and
+     * fewer than `window` chunks are unacknowledged (the receiver has one
+     * posted receive per window slot and re-posts before each ACK). The CQ
+     * is busy-polled so a newly read chunk is posted without waiting for the
+     * next completion event.
+     */
+    struct reader_ctx rc = {
+      .fd = fd, .direct_fd = direct_fd, .verbose = verbose,
+      .base = send_base, .buf_size = buf_size, .nslots = nslots,
+      .chunks = chunks, .file_size = params.file_size,
+    };
+    rc.bytes = calloc(nslots, sizeof(*rc.bytes));
+    if (!rc.bytes) { fprintf(stderr, "rdsend: out of memory\n"); return EXIT_FAILURE; }
+    pthread_t reader;
+    if (pthread_create(&reader, NULL, reader_worker, &rc) != 0) {
+      fprintf(stderr, "rdsend: failed to start reader thread\n");
+      return EXIT_FAILURE;
+    }
+    if (verbose)
+      fprintf(stderr, "Read-ahead: %u slots (%u MiB) beyond the %u-chunk window\n",
+              nslots - window, (nslots - window) * (buf_size / (1024U * 1024U)), window);
+
     total_bytes = 0;
-    uint64_t seq = 0;
-    while (seq < chunks) {
-      uint32_t batch = (uint32_t)((chunks - seq) < window ? (chunks - seq) : window);
-      for (uint32_t j = 0; j < batch; ++j) {
-        uint64_t chunk_seq = seq + j;
-        uint32_t slot = j;
-        char *slot_buf = send_base + (size_t)slot * buf_size;
-        uint64_t offset = chunk_seq * (uint64_t)buf_size;
-        uint64_t remaining = params.file_size - offset;
-        uint64_t bytes = 0;
-        if (direct_fd >= 0 && remaining < buf_size) {
-          size_t tail_bytes = 0;
-          if (pread_full_or_eof(fd, slot_buf, (size_t)remaining,
-                                (off_t)offset, &tail_bytes) != 0) {
-            fprintf(stderr, "rdsend: final buffered read failed at offset %llu: %s\n",
-                    (unsigned long long)offset, strerror(errno));
-            return EXIT_FAILURE;
-          }
-          bytes = tail_bytes;
-        } else if (read_file_parallel(direct_fd >= 0 ? direct_fd : fd,
-                                      slot_buf, buf_size, offset,
-                                      direct_fd >= 0, &bytes) != 0) {
-          int direct_error = errno;
-          if (direct_fd >= 0 && read_file_parallel(fd, slot_buf, buf_size,
-                                                   offset, 0, &bytes) == 0) {
-            if (verbose) fprintf(stderr, "rdsend: O_DIRECT chunk read failed (%s); retried buffered\n",
-                                 strerror(direct_error));
-          } else {
-            fprintf(stderr, "rdsend: parallel file read failed at offset %llu: %s\n",
-                    (unsigned long long)offset, strerror(errno));
-            return EXIT_FAILURE;
-          }
-        }
-        if (bytes == 0 || bytes > buf_size) {
-          fprintf(stderr, "rdsend: unexpected read length %llu at offset %llu\n",
-                  (unsigned long long)bytes, (unsigned long long)offset);
-          return EXIT_FAILURE;
-        }
-        ack_sge.addr = (uintptr_t)(ack_base + (size_t)slot * 4U);
+    uint64_t posted = 0, sends_done = 0, acks_done = 0;
+    double read_stall = 0.0, stall_start = 0.0;
+    int failed = 0;
+    while (acks_done < chunks || sends_done < chunks) {
+      /* Post every chunk that is read and fits in the window. */
+      uint64_t ready = __atomic_load_n(&rc.ready, __ATOMIC_ACQUIRE);
+      while (posted < chunks && posted - acks_done < window && posted < ready) {
+        uint32_t slot = (uint32_t)(posted % nslots);
+        uint64_t bytes = rc.bytes[slot];
+        ack_sge.addr = (uintptr_t)(ack_base + (size_t)(posted % window) * 4U);
         ack_sge.length = 4;
-        ack_recv.wr_id = chunk_seq;
+        ack_recv.wr_id = posted;
         if (ibv_post_recv(qp, &ack_recv, &bad_recv_wr)) {
           fprintf(stderr, "rdsend: failed to post ACK receive for chunk %llu: %s\n",
-                  (unsigned long long)chunk_seq, strerror(errno));
-          return EXIT_FAILURE;
+                  (unsigned long long)posted, strerror(errno));
+          failed = 1; break;
         }
-        sge.addr = (uintptr_t)slot_buf;
+        sge.addr = (uintptr_t)(send_base + (size_t)slot * buf_size);
         sge.length = (uint32_t)bytes;
-        send_wr.wr_id = chunk_seq + 2;
+        send_wr.wr_id = posted + 2;
         send_wr.opcode = IBV_WR_SEND;
         send_wr.send_flags = IBV_SEND_SIGNALED;
         send_wr.sg_list = &sge;
         send_wr.num_sge = 1;
         if (ibv_post_send(qp, &send_wr, &bad_send_wr)) {
           fprintf(stderr, "rdsend: failed to post data chunk %llu: %s\n",
-                  (unsigned long long)chunk_seq, strerror(errno));
-          return EXIT_FAILURE;
+                  (unsigned long long)posted, strerror(errno));
+          failed = 1; break;
         }
         total_bytes += bytes;
+        posted++;
+      }
+      if (failed) break;
+
+      /* Window has room but the next chunk is not read yet: disk-bound. */
+      int starved = posted < chunks && posted - acks_done < window &&
+                    posted >= __atomic_load_n(&rc.ready, __ATOMIC_ACQUIRE);
+      if (starved && stall_start == 0.0) stall_start = now_sec();
+      else if (!starved && stall_start != 0.0) {
+        read_stall += now_sec() - stall_start;
+        stall_start = 0.0;
+      }
+      int rerr = __atomic_load_n(&rc.err, __ATOMIC_ACQUIRE);
+      if (rerr) {
+        fprintf(stderr, "rdsend: file read failed at offset %llu: %s\n",
+                (unsigned long long)rc.err_offset, strerror(rerr));
+        failed = 1; break;
       }
 
-      uint32_t send_done = 0, ack_done = 0;
-      while (send_done < batch || ack_done < batch) {
-        if (wait_cq_completion(cq, comp_chan, &wc, &event_count) != 0) {
-          fprintf(stderr, "rdsend: waiting for pipeline completion failed: %s\n", strerror(errno));
-          return EXIT_FAILURE;
-        }
-        if (wc.status != IBV_WC_SUCCESS) {
-          fprintf(stderr, "rdsend: pipeline completion failed: %s (vendor_err=%u)\n",
-                  ibv_wc_status_str(wc.status), wc.vendor_err);
-          return EXIT_FAILURE;
-        }
-        if (wc.opcode == IBV_WC_RECV) ack_done++;
-        else if (wc.opcode == IBV_WC_SEND) send_done++;
+      int n = ibv_poll_cq(cq, 1, &wc);
+      if (n < 0) {
+        fprintf(stderr, "rdsend: ibv_poll_cq failed\n");
+        failed = 1; break;
       }
-      report_send_progress(verbose, total_bytes, transfer_start,
-                           &last_report_time, &last_report_bytes);
-      seq += batch;
+      if (n == 0) {
+        if (starved || posted == acks_done) sched_yield();
+        continue;
+      }
+      if (wc.status != IBV_WC_SUCCESS) {
+        fprintf(stderr, "rdsend: pipeline completion failed: %s (vendor_err=%u)\n",
+                ibv_wc_status_str(wc.status), wc.vendor_err);
+        failed = 1; break;
+      }
+      if (wc.opcode == IBV_WC_RECV) {
+        acks_done++;
+        report_send_progress(verbose, acks_done < chunks ?
+                             acks_done * (uint64_t)buf_size : params.file_size,
+                             transfer_start, &last_report_time, &last_report_bytes);
+      } else if (wc.opcode == IBV_WC_SEND) {
+        sends_done++;
+      }
+      __atomic_store_n(&rc.freed, sends_done < acks_done ? sends_done : acks_done,
+                       __ATOMIC_RELEASE);
     }
+    if (stall_start != 0.0) read_stall += now_sec() - stall_start;
+    __atomic_store_n(&rc.stop, 1, __ATOMIC_RELEASE);
+    pthread_join(reader, NULL);
+    free(rc.bytes);
+    if (failed) return EXIT_FAILURE;
+    if (verbose)
+      fprintf(stderr, "Read stall (window open, waiting on file read): %.3f s\n",
+              read_stall);
 
     /* End-of-stream sentinel remains ordered after all data sends. */
     ack_sge.addr = (uintptr_t)ack_base;

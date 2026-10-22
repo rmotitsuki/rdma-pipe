@@ -137,6 +137,7 @@ Sender (`rdsend`, sent to the receiver during the handshake):
 |---|---|---|
 | `RDMA_BUF_SIZE` | 32 | Chunk size in MiB |
 | `RDMA_RING_SIZE` | 4 | Chunks in flight (2..8) |
+| `RDSEND_READ_AHEAD` | ring size | Extra send slots that a reader thread fills ahead of the in-flight window, so file reads overlap with RDMA sends (0..64). |
 
 Receiver (`rdrecv`, zero-copy file path):
 
