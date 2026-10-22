@@ -517,9 +517,17 @@ int main(int argc, char *argv[]) {
   uint32_t event_count = 0;
   uint64_t total_bytes = 0;
 
-  TS("transfer start");
-  double transfer_start = now_sec();
-  double last_report_time = transfer_start;
+  /*
+   * Timing: the clock starts only once the sender has authenticated (key
+   * received and verified), i.e. at the same protocol event at which rdsend
+   * starts its own clock. Waiting for the sender to connect/set up is reported
+   * separately as setup time. The data clock stops when the end-of-stream
+   * sentinel arrives; persistence (munmap/ftruncate/fdatasync) is measured
+   * separately because the sender does not wait for it.
+   */
+  double transfer_start = 0.0;
+  double transfer_end = 0.0;
+  double last_report_time = 0.0;
   uint64_t last_report_bytes = 0;
 
   if (file_map) {
@@ -557,6 +565,9 @@ int main(int argc, char *argv[]) {
       fprintf(stderr, "Wrong key received\n");
       return EXIT_FAILURE;
     }
+    TS("transfer start (key verified)");
+    transfer_start = now_sec();
+    last_report_time = transfer_start;
     struct ibv_sge *data_sges = calloc(window, sizeof(*data_sges));
     struct ibv_recv_wr *data_wrs = calloc(window, sizeof(*data_wrs));
     if (!data_sges || !data_wrs) {
@@ -627,6 +638,7 @@ int main(int argc, char *argv[]) {
           return EXIT_FAILURE;
         }
         sentinel_received = 1;
+        transfer_end = now_sec();
       } else {
         uint64_t seq = wc.wr_id;
         if (seq != next_to_complete || seq >= data_chunks) {
@@ -693,8 +705,6 @@ int main(int argc, char *argv[]) {
 
     TS("final sentinel received; transfer done");
     TS("transfer data complete");
-    if (verbose) fprintf(stderr, "Transfer time (elapsed): %.3f s; received: %llu bytes\n",
-                         now_sec() - transfer_start, (unsigned long long)total_bytes);
     TS("finalization start");
     TS("munmap start");
     if (munmap(file_map, file_map_size) < 0) {
@@ -744,12 +754,18 @@ int main(int argc, char *argv[]) {
       if (msgLen <= buf_size) {
         char *cbuf = (char *)slots[recv_slot];
         uint32_t i;
+        int key_was_pending = keyIdx < keylen + 1;
         for (i = 0; i < msgLen && keyIdx < keylen+1; i++, keyIdx++, cbuf++) {
           if (*cbuf != key[keyIdx]) {
             fprintf(stderr, "Wrong key received\n");
             ibv_ack_cq_events(cq, event_count);
             return 20;
           }
+        }
+        if (key_was_pending && keyIdx == keylen + 1) {
+          TS("transfer start (key verified)");
+          transfer_start = now_sec();
+          last_report_time = transfer_start;
         }
         if (i == 0 && msgLen > 0) {
           int write_rc;
@@ -779,13 +795,16 @@ int main(int argc, char *argv[]) {
         }
       }
 
-      if (msgLen == 0) { TS("final sentinel received; transfer done"); break; }
+      if (msgLen == 0) {
+        transfer_end = now_sec();
+        TS("final sentinel received; transfer done");
+        break;
+      }
 
       recv_slot = next_recv;
       next_recv = (recv_slot + 1) % (int)ring_size;
     }
     TS("transfer data complete");
-    if (verbose) fprintf(stderr, "Transfer time (elapsed): %.3f s; received: %llu bytes\n", now_sec() - transfer_start, (unsigned long long)total_bytes);
     TS("finalization start");
     /* Unknown-length streams may overwrite a pre-existing larger file. */
     TS("stream ftruncate start");
@@ -803,10 +822,25 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "rdrecv: fdatasync destination failed: %s\n", strerror(errno));
     return EXIT_FAILURE;
   }
-  double persist_seconds = now_sec() - persist_start;
-  if (verbose)
-    fprintf(stderr, "Persistence time (fdatasync): %.3f s\n", persist_seconds);
+  double persist_end = now_sec();
+  double persist_seconds = persist_end - persist_start;
   TS("fdatasync done");
+  if (verbose) {
+    if (transfer_start == 0.0) transfer_start = transfer_end; /* key never seen */
+    double xfer_seconds = transfer_end - transfer_start;
+    double durable_seconds = persist_end - transfer_start;
+    fprintf(stderr, "Setup time (process start -> transfer start): %.3f s\n",
+            transfer_start - _ts0);
+    fprintf(stderr, "Transfer time (elapsed): %.3f s\n", xfer_seconds);
+    fprintf(stderr, "Transferred: %llu bytes\n", (unsigned long long)total_bytes);
+    fprintf(stderr, "Bandwidth %.3f GB/s\n",
+            xfer_seconds > 0 ? (total_bytes / xfer_seconds) / 1e9 : 0.0);
+    fprintf(stderr, "Finalization time (sentinel -> fdatasync done): %.3f s "
+            "(fdatasync %.3f s)\n", persist_end - transfer_end, persist_seconds);
+    fprintf(stderr, "Transfer + persistence time: %.3f s; durable bandwidth %.3f GB/s\n",
+            durable_seconds,
+            durable_seconds > 0 ? (total_bytes / durable_seconds) / 1e9 : 0.0);
+  }
 
   TS("file close start");
   if (close(fd) < 0) {

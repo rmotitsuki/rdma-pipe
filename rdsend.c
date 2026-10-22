@@ -603,6 +603,11 @@ int main(int argc, char *argv[]) {
   recv_wr.sg_list = &rsge;
   recv_wr.num_sge = 1;
 
+  /*
+   * Stream path: the key travels in the first message together with the
+   * pipeline, so the clock starts here. The zero-copy path restarts the clock
+   * after the key ACK, which is the same event at which rdrecv starts timing.
+   */
   clock_gettime(CLOCK_MONOTONIC, &tmstart);
   TS("transfer start");
   transfer_start = now_sec();
@@ -656,6 +661,11 @@ int main(int argc, char *argv[]) {
       if (wc.opcode == IBV_WC_RECV) key_ack_done = 1;
       else if (wc.opcode == IBV_WC_SEND) key_send_done = 1;
     }
+    /* Receiver is authenticated and its first receive window is posted. */
+    clock_gettime(CLOCK_MONOTONIC, &tmstart);
+    TS("transfer start (key ACK received)");
+    transfer_start = now_sec();
+    last_report_time = transfer_start;
 
     total_bytes = 0;
     uint64_t seq = 0;
@@ -863,6 +873,8 @@ int main(int argc, char *argv[]) {
                      (double)(tmstart.tv_sec + tmstart.tv_nsec * 1e-9));
   TS("transfer data complete");
   if (verbose > 0) {
+    fprintf(stderr, "Setup time (process start -> transfer start): %.3f s\n",
+            transfer_start - _ts0);
     fprintf(stderr, "Transfer time (elapsed): %.3f s\n", seconds);
     fprintf(stderr, "Transferred: %llu bytes\n", (unsigned long long)total_bytes);
     fprintf(stderr, "Bandwidth %.3f GB/s\n", seconds > 0 ? (total_bytes / seconds) / 1e9 : 0.0);
