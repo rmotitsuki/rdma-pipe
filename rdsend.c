@@ -43,6 +43,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/vfs.h>
 #include <time.h>
 #include <unistd.h>
 #include <omp.h>
@@ -412,6 +413,9 @@ int main(int argc, char *argv[]) {
 
   int verbose = 0;
   int argv_idx = 1;
+  int zerocopy = 0;
+  char *src_map = NULL;
+  struct ibv_mr *src_mr = NULL;
 
   if (argc < 4) {
     usage();
@@ -489,6 +493,24 @@ int main(int argc, char *argv[]) {
       }
       params.file_size = (uint64_t)st.st_size;
       if (params.file_size > 0) {
+        /*
+         * RDSEND_ZEROCOPY = auto (default) | on | off. Zero-copy maps the
+         * source file and registers it with the NIC, so chunks are sent
+         * straight from the page cache with no read() copy. `auto` uses it
+         * only for tmpfs/shmem sources, whose pages are already in RAM; a
+         * disk file would be faulted in from one thread, which is slower
+         * than the parallel O_DIRECT readers.
+         */
+        const char *zc_env = getenv("RDSEND_ZEROCOPY");
+        struct statfs sfs;
+        int src_tmpfs = fstatfs(fd, &sfs) == 0 && sfs.f_type == 0x01021994; /* TMPFS_MAGIC */
+        if (!zc_env || !*zc_env || strcmp(zc_env, "auto") == 0) zerocopy = src_tmpfs;
+        else if (strcmp(zc_env, "on") == 0 || strcmp(zc_env, "1") == 0) zerocopy = 1;
+        else if (strcmp(zc_env, "off") == 0 || strcmp(zc_env, "0") == 0) zerocopy = 0;
+        else {
+          fprintf(stderr, "rdsend: RDSEND_ZEROCOPY must be auto, on or off\n");
+          return EXIT_FAILURE;
+        }
         direct_fd = open(argv[argv_idx], O_RDONLY | O_DIRECT);
         if (direct_fd < 0 && verbose)
           fprintf(stderr, "rdsend: O_DIRECT unavailable (%s); using buffered parallel reads\n",
@@ -568,7 +590,7 @@ int main(int argc, char *argv[]) {
     }
     read_ahead = (uint32_t)ra;
   }
-  uint32_t nslots = params.ring_size + (params.file_size > 0 ? read_ahead : 0);
+  uint32_t nslots = params.ring_size + (params.file_size > 0 && !zerocopy ? read_ahead : 0);
   if ((uint64_t)buf_size * nslots + params.ring_size * 4ULL > UINT32_MAX) {
     fprintf(stderr, "rdsend: RDMA buffer ring is too large (%u slots of %u bytes)\n",
             nslots, buf_size);
@@ -607,6 +629,33 @@ int main(int argc, char *argv[]) {
 
   mr = ibv_reg_mr(pd, buf, buf_len, IBV_ACCESS_LOCAL_WRITE);
   if (!mr) { fprintf(stderr, "rdsend: ibv_reg_mr failed for %u-byte buffer: %s; check RLIMIT_MEMLOCK and pinned-memory limits\n", buf_len, strerror(errno)); return 99; }
+
+  if (zerocopy) {
+    double z0 = now_sec();
+    int src_odp = 0;
+    src_map = mmap(NULL, (size_t)params.file_size, PROT_READ, MAP_SHARED, fd, 0);
+    if (src_map == MAP_FAILED) {
+      src_map = NULL;
+    } else {
+      /* Pinned first (static NIC translation); ODP if the kernel refuses. */
+      src_mr = ibv_reg_mr(pd, src_map, (size_t)params.file_size, 0);
+      if (!src_mr) {
+        src_odp = 1;
+        src_mr = ibv_reg_mr(pd, src_map, (size_t)params.file_size, IBV_ACCESS_ON_DEMAND);
+      }
+    }
+    if (!src_mr) {
+      fprintf(stderr, "rdsend: zero-copy registration of the source failed (%s); "
+              "using reader threads\n", strerror(errno));
+      if (src_map) munmap(src_map, (size_t)params.file_size);
+      src_map = NULL;
+      zerocopy = 0;
+    } else if (verbose) {
+      fprintf(stderr, "Zero-copy source: %.2f GiB registered (%s) in %.3f s\n",
+              (double)params.file_size / (1024.0 * 1024.0 * 1024.0),
+              src_odp ? "ODP" : "pinned", now_sec() - z0);
+    }
+  }
 
   struct ibv_qp_init_attr qp_init = {
       .send_cq = cq,
@@ -800,15 +849,17 @@ int main(int argc, char *argv[]) {
     if ((uint32_t)nreaders > nslots) nreaders = (int)nslots;
     pthread_t readers[64];
     int nstarted = 0;
-    for (int i = 0; i < nreaders; ++i) {
+    for (int i = 0; !zerocopy && i < nreaders; ++i) {
       if (pthread_create(&readers[i], NULL, reader_worker, &rc) != 0) break;
       nstarted++;
     }
-    if (nstarted == 0) {
+    if (!zerocopy && nstarted == 0) {
       fprintf(stderr, "rdsend: failed to start reader threads\n");
       return EXIT_FAILURE;
     }
-    if (verbose)
+    if (zerocopy && verbose)
+      fprintf(stderr, "Zero-copy send: chunks go straight from the source mapping, no reader threads\n");
+    else if (verbose)
       fprintf(stderr, "Read-ahead: %u slots (%u MiB) beyond the %u-chunk window, %d reader threads\n",
               nslots - window, (nslots - window) * (buf_size / (1024U * 1024U)),
               window, nstarted);
@@ -820,9 +871,13 @@ int main(int argc, char *argv[]) {
     while (acks_done < chunks || sends_done < chunks) {
       /* Post every chunk that is read and fits in the window. */
       while (posted < chunks && posted - acks_done < window &&
-             __atomic_load_n(&rc.slot_seq[posted % nslots], __ATOMIC_ACQUIRE) == posted + 1) {
+             (zerocopy ||
+              __atomic_load_n(&rc.slot_seq[posted % nslots], __ATOMIC_ACQUIRE) == posted + 1)) {
         uint32_t slot = (uint32_t)(posted % nslots);
-        uint64_t bytes = rc.bytes[slot];
+        uint64_t zc_off = posted * (uint64_t)buf_size;
+        uint64_t bytes = zerocopy ?
+            (params.file_size - zc_off < buf_size ? params.file_size - zc_off : buf_size) :
+            rc.bytes[slot];
         ack_sge.addr = (uintptr_t)(ack_base + (size_t)(posted % window) * 4U);
         ack_sge.length = 4;
         ack_recv.wr_id = posted;
@@ -831,8 +886,10 @@ int main(int argc, char *argv[]) {
                   (unsigned long long)posted, strerror(errno));
           failed = 1; break;
         }
-        sge.addr = (uintptr_t)(send_base + (size_t)slot * buf_size);
+        sge.addr = zerocopy ? (uintptr_t)(src_map + zc_off)
+                            : (uintptr_t)(send_base + (size_t)slot * buf_size);
         sge.length = (uint32_t)bytes;
+        sge.lkey = zerocopy ? src_mr->lkey : mr->lkey;
         send_wr.wr_id = posted + 2;
         send_wr.opcode = IBV_WR_SEND;
         send_wr.send_flags = IBV_SEND_SIGNALED;
@@ -849,7 +906,7 @@ int main(int argc, char *argv[]) {
       if (failed) break;
 
       /* Window has room but the next chunk is not read yet: disk-bound. */
-      int starved = posted < chunks && posted - acks_done < window &&
+      int starved = !zerocopy && posted < chunks && posted - acks_done < window &&
                     __atomic_load_n(&rc.slot_seq[posted % nslots], __ATOMIC_ACQUIRE) != posted + 1;
       if (starved && stall_start == 0.0) stall_start = now_sec();
       else if (!starved && stall_start != 0.0) {
@@ -893,8 +950,9 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < nstarted; ++i) pthread_join(readers[i], NULL);
     free(rc.bytes);
     free(rc.slot_seq);
+    sge.lkey = mr->lkey;   /* the sentinel goes from the send buffer */
     if (failed) return EXIT_FAILURE;
-    if (verbose) {
+    if (verbose && !zerocopy) {
       fprintf(stderr, "Read stall (window open, waiting on file read): %.3f s\n",
               read_stall);
       if (rc.busy_seconds > 0)
@@ -1038,6 +1096,8 @@ int main(int argc, char *argv[]) {
 
   ibv_ack_cq_events(cq, event_count);
 
+  if (src_mr) ibv_dereg_mr(src_mr);
+  if (src_map) munmap(src_map, (size_t)params.file_size);
   ibv_destroy_qp(qp);
   ibv_dereg_mr(mr);
   ibv_destroy_cq(cq);
