@@ -149,6 +149,9 @@ Receiver (`rdrecv`, zero-copy file path):
 |---|---|---|
 | `RDRECV_WRITEBACK_LAG` | 8 | Start page-cache writeback of each chunk as it completes and wait for the chunk this many positions behind before ACKing. Bounds dirty memory and makes the sender run at disk speed. `0` disables (the whole file is flushed by the final `fdatasync`). |
 | `RDRECV_FALLOCATE` | `auto` | Reserve the destination blocks with `fallocate` before the transfer. `auto` = on unless the destination is tmpfs; `on` / `off` force it. |
+| `RDRECV_MODE` | `auto` | `mmap`: the NIC writes straight into the mapped destination (best for tmpfs). `direct`: receive into a ring of registered slots and write them with `O_DIRECT` writer threads (disk destinations; avoids buffered writeback). `auto` = mmap for tmpfs, direct otherwise. |
+| `RDRECV_WRITE_THREADS` | 8 | `direct` mode: parallel `O_DIRECT` writer threads. |
+| `RDRECV_WRITE_AHEAD` | ring size, at most 256 MiB | `direct` mode: slots beyond the receive window that can be waiting for or under disk writes. |
 | `RDRECV_ODP` | `on` | `on`: register the destination with On-Demand Paging. `off`: populate it with the prefault threads and pin it (classic registration); works on tmpfs, falls back to ODP where the kernel refuses to pin file pages. |
 | `RDRECV_PREFAULT` | `ahead` | `ahead`: worker threads allocate destination pages and prefetch NIC translations ahead of the receive window. `upfront`: do it for the whole file before the transfer (reported as setup). `off`: let ODP fault pages in during the transfer. |
 | `RDRECV_PREFAULT_THREADS` | 8 | Prefault worker threads. |
