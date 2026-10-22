@@ -41,6 +41,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <time.h>
 #include <unistd.h>
 #include <omp.h>
@@ -392,8 +393,8 @@ int main(int argc, char *argv[]) {
   uint32_t buf_size  = params.buf_size;
   uint32_t ring_size = params.ring_size < 2 ? 2 : params.ring_size;
   int direct_fd = -1;
-  if (ring_size > 8) {
-    fprintf(stderr, "rdrecv: unsupported pipeline depth %u (maximum 8)\n", ring_size);
+  if (ring_size > 64) {
+    fprintf(stderr, "rdrecv: unsupported pipeline depth %u (maximum 64)\n", ring_size);
     close(tcp_sock); close(fd);
     return EXIT_FAILURE;
   }
@@ -445,6 +446,42 @@ int main(int argc, char *argv[]) {
       fprintf(stderr, "rdrecv: ftruncate destination to %zu bytes failed: %s\\n",
               file_map_size, strerror(errno));
       return 1;
+    }
+    /*
+     * RDRECV_FALLOCATE = auto (default) | on | off. Reserving the blocks up
+     * front avoids block allocation during writeback and fragmentation on
+     * disk filesystems (it helped the NVMe-oF tests). On tmpfs it would only
+     * allocate pages single-threaded under the inode lock, which the
+     * parallel prefault already does faster, so `auto` skips tmpfs.
+     */
+    {
+      const char *fa = getenv("RDRECV_FALLOCATE");
+      struct statfs sfs;
+      int is_tmpfs = fstatfs(fd, &sfs) == 0 && sfs.f_type == 0x01021994; /* TMPFS_MAGIC */
+      int do_fa;
+      if (!fa || !*fa || strcmp(fa, "auto") == 0) do_fa = !is_tmpfs;
+      else if (strcmp(fa, "on") == 0 || strcmp(fa, "1") == 0) do_fa = 1;
+      else if (strcmp(fa, "off") == 0 || strcmp(fa, "0") == 0) do_fa = 0;
+      else {
+        fprintf(stderr, "rdrecv: RDRECV_FALLOCATE must be auto, on or off\n");
+        return EXIT_FAILURE;
+      }
+      if (do_fa) {
+        TS("fallocate start");
+        double fa0 = now_sec();
+        if (fallocate(fd, 0, 0, (off_t)file_map_size) != 0) {
+          if (verbose)
+            fprintf(stderr, "rdrecv: fallocate failed (%s); continuing without it\n",
+                    strerror(errno));
+        } else if (verbose) {
+          fprintf(stderr, "fallocate: %.3f s for %.2f GiB%s\n", now_sec() - fa0,
+                  (double)file_map_size / (1024.0 * 1024.0 * 1024.0),
+                  is_tmpfs ? " (tmpfs)" : "");
+        }
+        TS("fallocate done");
+      } else if (verbose) {
+        fprintf(stderr, "fallocate: skipped%s\n", is_tmpfs ? " (tmpfs)" : "");
+      }
     }
     file_map = mmap(NULL, file_map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (file_map == MAP_FAILED) {
@@ -505,15 +542,68 @@ int main(int argc, char *argv[]) {
       IBV_ACCESS_REMOTE_WRITE;
 
   /*
-   * Use On-Demand Paging for the file-backed MAP_SHARED receive mapping.
-   * The RDMA device and driver must support ODP.
+   * RDRECV_ODP = on (default) | off for the file-backed receive mapping.
+   *   on:  On-Demand Paging; the NIC faults destination pages in as it
+   *        writes (prefault below hides most of that cost).
+   *   off: classic pinned registration. Works for tmpfs/shmem (the kernel
+   *        refuses long-term pins of most disk-filesystem pages; then we
+   *        fall back to ODP). Pages are populated by worker threads first,
+   *        because pinning alone would fault 10 GiB in from one thread.
    */
+  int use_odp = file_map != NULL;
   if (file_map != NULL) {
-    mr_access |= IBV_ACCESS_ON_DEMAND;
+    const char *o = getenv("RDRECV_ODP");
+    if (o && (strcmp(o, "off") == 0 || strcmp(o, "0") == 0)) use_odp = 0;
+    else if (o && *o && strcmp(o, "on") != 0 && strcmp(o, "1") != 0) {
+      fprintf(stderr, "rdrecv: RDRECV_ODP must be on or off\n");
+      return EXIT_FAILURE;
+    }
   }
+  if (file_map != NULL && !use_odp) {
+    int nt = 8;
+    const char *t = getenv("RDRECV_PREFAULT_THREADS");
+    if (t && *t) nt = atoi(t);
+    if (nt < 1) nt = 1;
+    if (nt > 64) nt = 64;
+    struct prefault_ctx pp = {0};
+    pp.base = file_map; pp.chunks = data_slots; pp.buf_size = buf_size;
+    pp.ahead = 0; pp.advise_ok = 0;
+    pp.ready = calloc(data_slots ? data_slots : 1, 1);
+    if (!pp.ready) { fprintf(stderr, "rdrecv: out of memory\n"); return EXIT_FAILURE; }
+    TS("populate before pinning start");
+    double p0 = now_sec();
+    prefault_scratch(&pp);
+    pthread_t th[64];
+    int started = 0;
+    for (int i = 0; i < nt; ++i) {
+      if (pthread_create(&th[i], NULL, prefault_worker, &pp) != 0) break;
+      started++;
+    }
+    if (started == 0) prefault_worker(&pp);
+    for (int i = 0; i < started; ++i) pthread_join(th[i], NULL);
+    free(pp.ready);
+    if (verbose)
+      fprintf(stderr, "Populate before pinning: %.3f s (%d threads)%s\n",
+              now_sec() - p0, started ? started : 1,
+              pp.touch_fallback ? " [touch fallback]" : "");
+    TS("populate before pinning done");
+  }
+  if (use_odp) mr_access |= IBV_ACCESS_ON_DEMAND;
 
+  double mr0 = now_sec();
   struct ibv_mr *mr =
       ibv_reg_mr(pd, rdma_buf, rdma_buf_size, mr_access);
+  if (!mr && file_map != NULL && !use_odp) {
+    fprintf(stderr, "rdrecv: pinned registration of the destination failed (%s); "
+            "falling back to ODP\n", strerror(errno));
+    use_odp = 1;
+    mr_access |= IBV_ACCESS_ON_DEMAND;
+    mr0 = now_sec();
+    mr = ibv_reg_mr(pd, rdma_buf, rdma_buf_size, mr_access);
+  }
+  if (mr && verbose && file_map != NULL)
+    fprintf(stderr, "Destination MR: %s, registered in %.3f s\n",
+            use_odp ? "ODP" : "pinned", now_sec() - mr0);
 
   if (!mr) {
     fprintf(stderr,
@@ -553,6 +643,7 @@ int main(int argc, char *argv[]) {
     pf.pd = pd; pf.mr = mr; pf.advise_ok = 1; pf.ahead = 64;
     const char *a = getenv("RDRECV_PREFAULT_AHEAD");
     if (a && *a) pf.ahead = strtoull(a, NULL, 10);
+    if (!use_odp) pf_mode = PF_OFF;   /* already populated and pinned */
     if (pf_mode == PF_UPFRONT) pf.ahead = 0;
     /* Window + in-flight tickets must fit in the prefault distance or the
      * workers and the main loop would wait on each other. */
