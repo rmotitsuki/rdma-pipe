@@ -44,6 +44,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <omp.h>
+#include <pthread.h>
+#include <sched.h>
 
 #include <infiniband/verbs.h>
 
@@ -136,6 +138,85 @@ static double now_sec(void) {
   return t.tv_sec + t.tv_nsec * 1e-9;
 }
 #define TS(label) do { if (verbose) fprintf(stderr, "TS %.3f %s\n", now_sec() - _ts0, label); } while(0)
+
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
+
+/*
+ * Destination prefault. With an ODP MR on a fresh tmpfs/page-cache file, every
+ * 4 KiB page is allocated, zeroed and mapped on the NIC's page fault while the
+ * data is arriving, which caps throughput (~1.5 GB/s observed vs ~3.9 GB/s on
+ * a pre-existing file). The prefault worker allocates and maps the pages
+ * (MADV_POPULATE_WRITE) and pre-loads the NIC translation (ibv_advise_mr
+ * PREFETCH_WRITE) ahead of the receive window.
+ */
+struct prefault_ctx {
+  char *base;
+  uint64_t chunks;            /* data slots */
+  uint32_t buf_size;
+  struct ibv_pd *pd;
+  struct ibv_mr *mr;
+  uint64_t ahead;             /* max chunks ahead of consumed; 0 = unlimited */
+  uint64_t next;              /* next chunk ticket (atomic) */
+  uint64_t consumed;          /* chunks completed by main loop (atomic) */
+  uint8_t *ready;             /* per-chunk ready flag (atomic) */
+  int stop;                   /* atomic */
+  int advise_ok;              /* atomic */
+  int touch_fallback;         /* atomic */
+};
+
+static void prefault_range(struct prefault_ctx *pf, char *addr, size_t len) {
+  if (!__atomic_load_n(&pf->touch_fallback, __ATOMIC_RELAXED) &&
+      madvise(addr, len, MADV_POPULATE_WRITE) != 0 && errno == EINVAL)
+    __atomic_store_n(&pf->touch_fallback, 1, __ATOMIC_RELAXED); /* < 5.14 */
+  if (__atomic_load_n(&pf->touch_fallback, __ATOMIC_RELAXED)) {
+    /* Content is overwritten by RDMA anyway; read-modify-write keeps it. */
+    for (size_t off = 0; off < len; off += 4096) {
+      volatile char *c = addr + off;
+      *c = *c;
+    }
+  }
+  if (__atomic_load_n(&pf->advise_ok, __ATOMIC_RELAXED)) {
+    struct ibv_sge sg = { .addr = (uintptr_t)addr, .length = (uint32_t)len,
+                          .lkey = pf->mr->lkey };
+    if (ibv_advise_mr(pf->pd, IBV_ADVISE_MR_ADVICE_PREFETCH_WRITE,
+                      IBV_ADVISE_MR_FLAG_FLUSH, &sg, 1) != 0)
+      __atomic_store_n(&pf->advise_ok, 0, __ATOMIC_RELAXED); /* unsupported */
+  }
+}
+
+static void prefault_scratch(struct prefault_ctx *pf) {
+  prefault_range(pf, pf->base + pf->chunks * (uint64_t)pf->buf_size,
+                 2ULL * pf->buf_size);
+}
+
+/* Several workers take chunk tickets in order; each marks its chunk ready. */
+static void *prefault_worker(void *arg) {
+  struct prefault_ctx *pf = arg;
+  for (;;) {
+    uint64_t i = __atomic_fetch_add(&pf->next, 1, __ATOMIC_ACQ_REL);
+    if (i >= pf->chunks) return NULL;
+    while (pf->ahead &&
+           i >= __atomic_load_n(&pf->consumed, __ATOMIC_ACQUIRE) + pf->ahead) {
+      if (__atomic_load_n(&pf->stop, __ATOMIC_ACQUIRE)) return NULL;
+      nanosleep((const struct timespec[]){{0, 50000L}}, NULL);
+    }
+    if (__atomic_load_n(&pf->stop, __ATOMIC_ACQUIRE)) return NULL;
+    prefault_range(pf, pf->base + i * (uint64_t)pf->buf_size, pf->buf_size);
+    __atomic_store_n(&pf->ready[i], 1, __ATOMIC_RELEASE);
+  }
+}
+
+/* Block until chunk `seq` has been prefaulted; returns seconds waited. */
+static double prefault_wait(struct prefault_ctx *pf, uint64_t seq) {
+  if (__atomic_load_n(&pf->ready[seq], __ATOMIC_ACQUIRE)) return 0.0;
+  struct timespec a, b;
+  clock_gettime(CLOCK_MONOTONIC, &a);
+  while (!__atomic_load_n(&pf->ready[seq], __ATOMIC_ACQUIRE)) sched_yield();
+  clock_gettime(CLOCK_MONOTONIC, &b);
+  return (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) * 1e-9;
+}
 
 /* Wait for one completion while using the completion channel safely. */
 static int wait_cq_completion(struct ibv_cq *cq,
@@ -443,6 +524,73 @@ int main(int argc, char *argv[]) {
 
   TS("ibv_reg_mr done");
 
+  /*
+   * RDRECV_PREFAULT = ahead (default) | upfront | off
+   * RDRECV_PREFAULT_THREADS = worker threads (default 8). A single thread
+   *   allocates+zeroes tmpfs pages at only ~1.9 GB/s.
+   * RDRECV_PREFAULT_AHEAD = max chunks prefaulted beyond the last completed
+   *   one (default 64; 0 = unlimited). Bounds extra dirty page cache when the
+   *   destination is a real disk.
+   */
+  enum { PF_OFF, PF_AHEAD, PF_UPFRONT } pf_mode = PF_AHEAD;
+  struct prefault_ctx pf = {0};
+  pthread_t pf_threads[64];
+  int pf_nthreads = 8, pf_started = 0;
+  double pf_wait_seconds = 0.0;
+  if (file_map != NULL) {
+    const char *m = getenv("RDRECV_PREFAULT");
+    if (m && strcmp(m, "off") == 0) pf_mode = PF_OFF;
+    else if (m && strcmp(m, "upfront") == 0) pf_mode = PF_UPFRONT;
+    else if (m && *m && strcmp(m, "ahead") != 0) {
+      fprintf(stderr, "rdrecv: RDRECV_PREFAULT must be ahead, upfront or off\n");
+      return EXIT_FAILURE;
+    }
+    const char *t = getenv("RDRECV_PREFAULT_THREADS");
+    if (t && *t) pf_nthreads = atoi(t);
+    if (pf_nthreads < 1) pf_nthreads = 1;
+    if (pf_nthreads > 64) pf_nthreads = 64;
+    pf.base = file_map; pf.chunks = data_slots; pf.buf_size = buf_size;
+    pf.pd = pd; pf.mr = mr; pf.advise_ok = 1; pf.ahead = 64;
+    const char *a = getenv("RDRECV_PREFAULT_AHEAD");
+    if (a && *a) pf.ahead = strtoull(a, NULL, 10);
+    if (pf_mode == PF_UPFRONT) pf.ahead = 0;
+    /* Window + in-flight tickets must fit in the prefault distance or the
+     * workers and the main loop would wait on each other. */
+    if (pf.ahead && pf.ahead <= ring_size + (uint64_t)pf_nthreads)
+      pf.ahead = ring_size + (uint64_t)pf_nthreads + 1;
+    pf.ready = calloc(data_slots ? data_slots : 1, 1);
+    if (!pf.ready) { fprintf(stderr, "rdrecv: out of memory\n"); return EXIT_FAILURE; }
+
+    if (pf_mode != PF_OFF) {
+      prefault_scratch(&pf);
+      if (pf_mode == PF_UPFRONT) TS("prefault (upfront) start");
+      double t0 = now_sec();
+      for (int i = 0; i < pf_nthreads; ++i) {
+        if (pthread_create(&pf_threads[i], NULL, prefault_worker, &pf) != 0) break;
+        pf_started++;
+      }
+      if (pf_started == 0) {
+        fprintf(stderr, "rdrecv: prefault threads failed; continuing without prefault\n");
+        pf_mode = PF_OFF;
+      } else if (pf_mode == PF_UPFRONT) {
+        for (int i = 0; i < pf_started; ++i) pthread_join(pf_threads[i], NULL);
+        pf_started = 0;
+        if (verbose)
+          fprintf(stderr, "Prefault (upfront): %.3f s for %.2f GiB (%.2f GB/s)\n",
+                  now_sec() - t0,
+                  (double)data_slots * buf_size / (1024.0 * 1024.0 * 1024.0),
+                  (double)data_slots * buf_size / (now_sec() - t0) / 1e9);
+        TS("prefault (upfront) done");
+      }
+    }
+    if (verbose)
+      fprintf(stderr, "Prefault mode: %s (%d threads, ahead %llu chunks)%s%s\n",
+              pf_mode == PF_OFF ? "off" : pf_mode == PF_UPFRONT ? "upfront" : "ahead",
+              pf_mode == PF_OFF ? 0 : pf_nthreads, (unsigned long long)pf.ahead,
+              pf.touch_fallback ? " [touch fallback]" : "",
+              pf_mode != PF_OFF && !pf.advise_ok ? " [no ibv_advise_mr]" : "");
+  }
+
   struct ibv_qp_init_attr qp_attr = {
     .send_cq = cq, .recv_cq = cq, .qp_type = IBV_QPT_RC,
     .cap = { .max_send_wr=ring_size + 2, .max_send_sge=1, .max_recv_wr=ring_size + 2, .max_recv_sge=1 },
@@ -517,9 +665,17 @@ int main(int argc, char *argv[]) {
   uint32_t event_count = 0;
   uint64_t total_bytes = 0;
 
-  TS("transfer start");
-  double transfer_start = now_sec();
-  double last_report_time = transfer_start;
+  /*
+   * Timing: the clock starts only once the sender has authenticated (key
+   * received and verified), i.e. at the same protocol event at which rdsend
+   * starts its own clock. Waiting for the sender to connect/set up is reported
+   * separately as setup time. The data clock stops when the end-of-stream
+   * sentinel arrives; persistence (munmap/ftruncate/fdatasync) is measured
+   * separately because the sender does not wait for it.
+   */
+  double transfer_start = 0.0;
+  double transfer_end = 0.0;
+  double last_report_time = 0.0;
   uint64_t last_report_bytes = 0;
 
   if (file_map) {
@@ -546,6 +702,29 @@ int main(int argc, char *argv[]) {
     int sentinel_posted = 0;
     int sentinel_received = 0;
 
+    /*
+     * Pipelined writeback. RDMA (ODP) writes land in the page cache without
+     * going through write(), so the kernel never throttles them: the whole
+     * file becomes dirty and is only flushed by the final fdatasync. Instead,
+     * start writeback of every chunk as soon as it completes, and wait for the
+     * chunk `wb_lag` positions behind before ACKing. That bounds dirty memory
+     * to ~wb_lag chunks and propagates disk speed back to the sender, so both
+     * sides measure the same (durable) transfer rate.
+     * RDRECV_WRITEBACK_LAG=<chunks> overrides the lag; 0 disables it.
+     */
+    uint64_t wb_lag = 8;
+    const char *wb_env = getenv("RDRECV_WRITEBACK_LAG");
+    if (wb_env && *wb_env) wb_lag = strtoull(wb_env, NULL, 10);
+    double wb_wait_seconds = 0.0;
+    if (verbose) {
+      if (wb_lag)
+        fprintf(stderr, "Pipelined writeback: lag %llu chunks (~%llu MiB dirty max)\n",
+                (unsigned long long)wb_lag,
+                (unsigned long long)(wb_lag * buf_size / (1024U * 1024U)));
+      else
+        fprintf(stderr, "Pipelined writeback: disabled\n");
+    }
+
     /* Complete key exchange first. */
     if (wait_cq_completion(cq, comp_chan, &wc, &event_count) != 0 ||
         wc.status != IBV_WC_SUCCESS || wc.opcode != IBV_WC_RECV ||
@@ -557,6 +736,9 @@ int main(int argc, char *argv[]) {
       fprintf(stderr, "Wrong key received\n");
       return EXIT_FAILURE;
     }
+    TS("transfer start (key verified)");
+    transfer_start = now_sec();
+    last_report_time = transfer_start;
     struct ibv_sge *data_sges = calloc(window, sizeof(*data_sges));
     struct ibv_recv_wr *data_wrs = calloc(window, sizeof(*data_wrs));
     if (!data_sges || !data_wrs) {
@@ -566,6 +748,7 @@ int main(int argc, char *argv[]) {
     }
 
     for (uint32_t slot = 0; slot < window && next_to_post < data_chunks; ++slot) {
+      if (pf_mode != PF_OFF) pf_wait_seconds += prefault_wait(&pf, next_to_post);
       data_sges[slot].addr = (uintptr_t)(file_map + next_to_post * (uint64_t)buf_size);
       data_sges[slot].length = buf_size;
       data_sges[slot].lkey = mr->lkey;
@@ -627,6 +810,7 @@ int main(int argc, char *argv[]) {
           return EXIT_FAILURE;
         }
         sentinel_received = 1;
+        transfer_end = now_sec();
       } else {
         uint64_t seq = wc.wr_id;
         if (seq != next_to_complete || seq >= data_chunks) {
@@ -645,11 +829,40 @@ int main(int argc, char *argv[]) {
         }
         total_bytes += wc.byte_len;
         next_to_complete++;
+
+        if (wb_lag) {
+          off_t off = (off_t)(seq * (uint64_t)buf_size);
+          double ws = now_sec();
+          if (sync_file_range(fd, off, (off_t)wc.byte_len,
+                              SYNC_FILE_RANGE_WRITE) < 0) {
+            fprintf(stderr, "rdrecv: sync_file_range(start) chunk %llu failed: %s\n",
+                    (unsigned long long)seq, strerror(errno));
+            free(data_sges); free(data_wrs);
+            return EXIT_FAILURE;
+          }
+          if (seq >= wb_lag) {
+            off_t old_off = (off_t)((seq - wb_lag) * (uint64_t)buf_size);
+            if (sync_file_range(fd, old_off, (off_t)buf_size,
+                                SYNC_FILE_RANGE_WAIT_BEFORE |
+                                SYNC_FILE_RANGE_WRITE |
+                                SYNC_FILE_RANGE_WAIT_AFTER) < 0) {
+              fprintf(stderr, "rdrecv: sync_file_range(wait) chunk %llu failed: %s\n",
+                      (unsigned long long)(seq - wb_lag), strerror(errno));
+              free(data_sges); free(data_wrs);
+              return EXIT_FAILURE;
+            }
+          }
+          wb_wait_seconds += now_sec() - ws;   /* start + wait: both can block */
+        }
+
         report_progress(verbose, total_bytes, transfer_start,
                         &last_report_time, &last_report_bytes);
 
         /* Replenish the receive window before acknowledging this chunk. */
+        if (pf_mode != PF_OFF)
+          __atomic_store_n(&pf.consumed, next_to_complete, __ATOMIC_RELEASE);
         if (next_to_post < data_chunks) {
+          if (pf_mode != PF_OFF) pf_wait_seconds += prefault_wait(&pf, next_to_post);
           uint32_t slot = (uint32_t)(seq % window);
           data_sges[slot].addr = (uintptr_t)(file_map + next_to_post * (uint64_t)buf_size);
           data_sges[slot].length = buf_size;
@@ -693,8 +906,21 @@ int main(int argc, char *argv[]) {
 
     TS("final sentinel received; transfer done");
     TS("transfer data complete");
-    if (verbose) fprintf(stderr, "Transfer time (elapsed): %.3f s; received: %llu bytes\n",
-                         now_sec() - transfer_start, (unsigned long long)total_bytes);
+    if (verbose && wb_lag)
+      fprintf(stderr, "Writeback backpressure (time blocked on disk): %.3f s\n",
+              wb_wait_seconds);
+    if (pf_started) {
+      __atomic_store_n(&pf.stop, 1, __ATOMIC_RELEASE);
+      for (int i = 0; i < pf_started; ++i) pthread_join(pf_threads[i], NULL);
+      pf_started = 0;
+    }
+    free(pf.ready);
+    pf.ready = NULL;
+    if (verbose && pf_mode != PF_OFF)
+      fprintf(stderr, "Prefault stall (receive window waited on prefault): %.3f s%s%s\n",
+              pf_wait_seconds,
+              pf.touch_fallback ? " [touch fallback]" : "",
+              pf.advise_ok ? "" : " [no ibv_advise_mr]");
     TS("finalization start");
     TS("munmap start");
     if (munmap(file_map, file_map_size) < 0) {
@@ -744,12 +970,18 @@ int main(int argc, char *argv[]) {
       if (msgLen <= buf_size) {
         char *cbuf = (char *)slots[recv_slot];
         uint32_t i;
+        int key_was_pending = keyIdx < keylen + 1;
         for (i = 0; i < msgLen && keyIdx < keylen+1; i++, keyIdx++, cbuf++) {
           if (*cbuf != key[keyIdx]) {
             fprintf(stderr, "Wrong key received\n");
             ibv_ack_cq_events(cq, event_count);
             return 20;
           }
+        }
+        if (key_was_pending && keyIdx == keylen + 1) {
+          TS("transfer start (key verified)");
+          transfer_start = now_sec();
+          last_report_time = transfer_start;
         }
         if (i == 0 && msgLen > 0) {
           int write_rc;
@@ -779,13 +1011,16 @@ int main(int argc, char *argv[]) {
         }
       }
 
-      if (msgLen == 0) { TS("final sentinel received; transfer done"); break; }
+      if (msgLen == 0) {
+        transfer_end = now_sec();
+        TS("final sentinel received; transfer done");
+        break;
+      }
 
       recv_slot = next_recv;
       next_recv = (recv_slot + 1) % (int)ring_size;
     }
     TS("transfer data complete");
-    if (verbose) fprintf(stderr, "Transfer time (elapsed): %.3f s; received: %llu bytes\n", now_sec() - transfer_start, (unsigned long long)total_bytes);
     TS("finalization start");
     /* Unknown-length streams may overwrite a pre-existing larger file. */
     TS("stream ftruncate start");
@@ -803,10 +1038,25 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "rdrecv: fdatasync destination failed: %s\n", strerror(errno));
     return EXIT_FAILURE;
   }
-  double persist_seconds = now_sec() - persist_start;
-  if (verbose)
-    fprintf(stderr, "Persistence time (fdatasync): %.3f s\n", persist_seconds);
+  double persist_end = now_sec();
+  double persist_seconds = persist_end - persist_start;
   TS("fdatasync done");
+  if (verbose) {
+    if (transfer_start == 0.0) transfer_start = transfer_end; /* key never seen */
+    double xfer_seconds = transfer_end - transfer_start;
+    double durable_seconds = persist_end - transfer_start;
+    fprintf(stderr, "Setup time (process start -> transfer start): %.3f s\n",
+            transfer_start - _ts0);
+    fprintf(stderr, "Transfer time (elapsed): %.3f s\n", xfer_seconds);
+    fprintf(stderr, "Transferred: %llu bytes\n", (unsigned long long)total_bytes);
+    fprintf(stderr, "Bandwidth %.3f GB/s\n",
+            xfer_seconds > 0 ? (total_bytes / xfer_seconds) / 1e9 : 0.0);
+    fprintf(stderr, "Finalization time (sentinel -> fdatasync done): %.3f s "
+            "(fdatasync %.3f s)\n", persist_end - transfer_end, persist_seconds);
+    fprintf(stderr, "Transfer + persistence time: %.3f s; durable bandwidth %.3f GB/s\n",
+            durable_seconds,
+            durable_seconds > 0 ? (total_bytes / durable_seconds) / 1e9 : 0.0);
+  }
 
   TS("file close start");
   if (close(fd) < 0) {
