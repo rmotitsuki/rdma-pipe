@@ -554,6 +554,29 @@ int main(int argc, char *argv[]) {
     int sentinel_posted = 0;
     int sentinel_received = 0;
 
+    /*
+     * Pipelined writeback. RDMA (ODP) writes land in the page cache without
+     * going through write(), so the kernel never throttles them: the whole
+     * file becomes dirty and is only flushed by the final fdatasync. Instead,
+     * start writeback of every chunk as soon as it completes, and wait for the
+     * chunk `wb_lag` positions behind before ACKing. That bounds dirty memory
+     * to ~wb_lag chunks and propagates disk speed back to the sender, so both
+     * sides measure the same (durable) transfer rate.
+     * RDRECV_WRITEBACK_LAG=<chunks> overrides the lag; 0 disables it.
+     */
+    uint64_t wb_lag = 8;
+    const char *wb_env = getenv("RDRECV_WRITEBACK_LAG");
+    if (wb_env && *wb_env) wb_lag = strtoull(wb_env, NULL, 10);
+    double wb_wait_seconds = 0.0;
+    if (verbose) {
+      if (wb_lag)
+        fprintf(stderr, "Pipelined writeback: lag %llu chunks (~%llu MiB dirty max)\n",
+                (unsigned long long)wb_lag,
+                (unsigned long long)(wb_lag * buf_size / (1024U * 1024U)));
+      else
+        fprintf(stderr, "Pipelined writeback: disabled\n");
+    }
+
     /* Complete key exchange first. */
     if (wait_cq_completion(cq, comp_chan, &wc, &event_count) != 0 ||
         wc.status != IBV_WC_SUCCESS || wc.opcode != IBV_WC_RECV ||
@@ -657,6 +680,32 @@ int main(int argc, char *argv[]) {
         }
         total_bytes += wc.byte_len;
         next_to_complete++;
+
+        if (wb_lag) {
+          off_t off = (off_t)(seq * (uint64_t)buf_size);
+          if (sync_file_range(fd, off, (off_t)wc.byte_len,
+                              SYNC_FILE_RANGE_WRITE) < 0) {
+            fprintf(stderr, "rdrecv: sync_file_range(start) chunk %llu failed: %s\n",
+                    (unsigned long long)seq, strerror(errno));
+            free(data_sges); free(data_wrs);
+            return EXIT_FAILURE;
+          }
+          if (seq >= wb_lag) {
+            off_t old_off = (off_t)((seq - wb_lag) * (uint64_t)buf_size);
+            double w0 = now_sec();
+            if (sync_file_range(fd, old_off, (off_t)buf_size,
+                                SYNC_FILE_RANGE_WAIT_BEFORE |
+                                SYNC_FILE_RANGE_WRITE |
+                                SYNC_FILE_RANGE_WAIT_AFTER) < 0) {
+              fprintf(stderr, "rdrecv: sync_file_range(wait) chunk %llu failed: %s\n",
+                      (unsigned long long)(seq - wb_lag), strerror(errno));
+              free(data_sges); free(data_wrs);
+              return EXIT_FAILURE;
+            }
+            wb_wait_seconds += now_sec() - w0;
+          }
+        }
+
         report_progress(verbose, total_bytes, transfer_start,
                         &last_report_time, &last_report_bytes);
 
@@ -705,6 +754,9 @@ int main(int argc, char *argv[]) {
 
     TS("final sentinel received; transfer done");
     TS("transfer data complete");
+    if (verbose && wb_lag)
+      fprintf(stderr, "Writeback backpressure (time blocked on disk): %.3f s\n",
+              wb_wait_seconds);
     TS("finalization start");
     TS("munmap start");
     if (munmap(file_map, file_map_size) < 0) {
