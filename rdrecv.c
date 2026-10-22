@@ -41,6 +41,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <time.h>
 #include <unistd.h>
 #include <omp.h>
@@ -392,8 +393,8 @@ int main(int argc, char *argv[]) {
   uint32_t buf_size  = params.buf_size;
   uint32_t ring_size = params.ring_size < 2 ? 2 : params.ring_size;
   int direct_fd = -1;
-  if (ring_size > 8) {
-    fprintf(stderr, "rdrecv: unsupported pipeline depth %u (maximum 8)\n", ring_size);
+  if (ring_size > 64) {
+    fprintf(stderr, "rdrecv: unsupported pipeline depth %u (maximum 64)\n", ring_size);
     close(tcp_sock); close(fd);
     return EXIT_FAILURE;
   }
@@ -445,6 +446,42 @@ int main(int argc, char *argv[]) {
       fprintf(stderr, "rdrecv: ftruncate destination to %zu bytes failed: %s\\n",
               file_map_size, strerror(errno));
       return 1;
+    }
+    /*
+     * RDRECV_FALLOCATE = auto (default) | on | off. Reserving the blocks up
+     * front avoids block allocation during writeback and fragmentation on
+     * disk filesystems (it helped the NVMe-oF tests). On tmpfs it would only
+     * allocate pages single-threaded under the inode lock, which the
+     * parallel prefault already does faster, so `auto` skips tmpfs.
+     */
+    {
+      const char *fa = getenv("RDRECV_FALLOCATE");
+      struct statfs sfs;
+      int is_tmpfs = fstatfs(fd, &sfs) == 0 && sfs.f_type == 0x01021994; /* TMPFS_MAGIC */
+      int do_fa;
+      if (!fa || !*fa || strcmp(fa, "auto") == 0) do_fa = !is_tmpfs;
+      else if (strcmp(fa, "on") == 0 || strcmp(fa, "1") == 0) do_fa = 1;
+      else if (strcmp(fa, "off") == 0 || strcmp(fa, "0") == 0) do_fa = 0;
+      else {
+        fprintf(stderr, "rdrecv: RDRECV_FALLOCATE must be auto, on or off\n");
+        return EXIT_FAILURE;
+      }
+      if (do_fa) {
+        TS("fallocate start");
+        double fa0 = now_sec();
+        if (fallocate(fd, 0, 0, (off_t)file_map_size) != 0) {
+          if (verbose)
+            fprintf(stderr, "rdrecv: fallocate failed (%s); continuing without it\n",
+                    strerror(errno));
+        } else if (verbose) {
+          fprintf(stderr, "fallocate: %.3f s for %.2f GiB%s\n", now_sec() - fa0,
+                  (double)file_map_size / (1024.0 * 1024.0 * 1024.0),
+                  is_tmpfs ? " (tmpfs)" : "");
+        }
+        TS("fallocate done");
+      } else if (verbose) {
+        fprintf(stderr, "fallocate: skipped%s\n", is_tmpfs ? " (tmpfs)" : "");
+      }
     }
     file_map = mmap(NULL, file_map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (file_map == MAP_FAILED) {

@@ -463,8 +463,8 @@ int main(int argc, char *argv[]) {
     errno = 0;
     long ring = strtol(rs_env, &end, 10);
     if (errno || rs_env[0] == '\0' || *end != '\0' ||
-        ring < 2 || ring > 8) {
-      fprintf(stderr, "rdsend: invalid RDMA_RING_SIZE='%s' (expected integer 2..8)\n", rs_env);
+        ring < 2 || ring > 64) {
+      fprintf(stderr, "rdsend: invalid RDMA_RING_SIZE='%s' (expected integer 2..64)\n", rs_env);
       return EXIT_FAILURE;
     }
     params.ring_size = (uint32_t)ring;
@@ -553,7 +553,11 @@ int main(int argc, char *argv[]) {
    * read-ahead slots (default ring_size) for regular files, followed by one
    * 4-byte ACK receive area per window slot.
    */
+  /* Default read-ahead: ring_size slots, capped at 256 MiB of extra memory. */
   uint32_t read_ahead = params.ring_size;
+  uint32_t ra_cap = (uint32_t)((256ULL * 1024 * 1024) / buf_size);
+  if (ra_cap < 2) ra_cap = 2;
+  if (read_ahead > ra_cap) read_ahead = ra_cap;
   const char *ra_env = getenv("RDSEND_READ_AHEAD");
   if (ra_env && *ra_env) {
     char *end = NULL;
