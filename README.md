@@ -139,6 +139,8 @@ Sender (`rdsend`, sent to the receiver during the handshake):
 | `RDMA_RING_SIZE` | 4 | Chunks in flight (2..64). With smaller chunks (e.g. `RDMA_BUF_SIZE=4`) use a deeper window. |
 | `RDSEND_READ_AHEAD` | ring size, at most 256 MiB | Extra send slots filled ahead of the in-flight window, so file reads overlap with RDMA sends (0..64). |
 | `RDSEND_ZEROCOPY` | `auto` | Send chunks straight from the mapped source file, with no read copy and no reader threads. `auto` = on for tmpfs/shmem sources only; `on` / `off` force it. |
+| `RDSEND_ZEROCOPY_MR` | `odp` | Zero-copy source registration: `odp` (immediate; threads prefetch) or `pinned` (threads populate, then the file is pinned). |
+| `RDSEND_ZEROCOPY_THREADS` | 8 | Threads that fault in / prefetch the zero-copy source. |
 | `RDSEND_READ_THREADS` | 8 | Reader threads; each reads one whole chunk (O_DIRECT when possible), so several chunks are read concurrently. |
 
 Receiver (`rdrecv`, zero-copy file path):

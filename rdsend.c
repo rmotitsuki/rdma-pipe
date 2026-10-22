@@ -359,6 +359,62 @@ out:
   return NULL;
 }
 
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+
+/* Zero-copy source preparation: worker threads fault the source mapping in
+ * (and, for an ODP MR, prefetch the NIC translation) one chunk at a time. */
+struct zc_prep {
+  char *base;
+  uint64_t size;
+  uint32_t chunk;
+  uint64_t next;              /* atomic ticket */
+  struct ibv_pd *pd;
+  struct ibv_mr *mr;          /* non-NULL: ODP MR to prefetch */
+  int advise_ok;              /* atomic */
+  int touch_fallback;         /* atomic */
+};
+
+static void *zc_prep_worker(void *arg) {
+  struct zc_prep *z = arg;
+  for (;;) {
+    uint64_t i = __atomic_fetch_add(&z->next, 1, __ATOMIC_ACQ_REL);
+    uint64_t off = i * (uint64_t)z->chunk;
+    if (off >= z->size) return NULL;
+    size_t len = z->size - off < z->chunk ? (size_t)(z->size - off) : z->chunk;
+    char *addr = z->base + off;
+    if (!__atomic_load_n(&z->touch_fallback, __ATOMIC_RELAXED) &&
+        madvise(addr, len, MADV_POPULATE_READ) != 0 && errno == EINVAL)
+      __atomic_store_n(&z->touch_fallback, 1, __ATOMIC_RELAXED);
+    if (__atomic_load_n(&z->touch_fallback, __ATOMIC_RELAXED)) {
+      volatile char sink = 0;
+      for (size_t o = 0; o < len; o += 4096) sink += addr[o];
+      (void)sink;
+    }
+    if (z->mr && __atomic_load_n(&z->advise_ok, __ATOMIC_RELAXED)) {
+      struct ibv_sge sg = { .addr = (uintptr_t)addr, .length = (uint32_t)len,
+                            .lkey = z->mr->lkey };
+      if (ibv_advise_mr(z->pd, IBV_ADVISE_MR_ADVICE_PREFETCH,
+                        IBV_ADVISE_MR_FLAG_FLUSH, &sg, 1) != 0)
+        __atomic_store_n(&z->advise_ok, 0, __ATOMIC_RELAXED);
+    }
+  }
+}
+
+static double zc_prepare(struct zc_prep *z, int nthreads) {
+  double t0 = now_sec();
+  pthread_t th[64];
+  int started = 0;
+  for (int i = 0; i < nthreads && i < 64; ++i) {
+    if (pthread_create(&th[i], NULL, zc_prep_worker, z) != 0) break;
+    started++;
+  }
+  if (started == 0) zc_prep_worker(z);
+  for (int i = 0; i < started; ++i) pthread_join(th[i], NULL);
+  return now_sec() - t0;
+}
+
 /* Wait for one completion while using the completion channel safely. */
 static int wait_cq_completion(struct ibv_cq *cq,
                               struct ibv_comp_channel *channel,
@@ -631,18 +687,53 @@ int main(int argc, char *argv[]) {
   if (!mr) { fprintf(stderr, "rdsend: ibv_reg_mr failed for %u-byte buffer: %s; check RLIMIT_MEMLOCK and pinned-memory limits\n", buf_len, strerror(errno)); return 99; }
 
   if (zerocopy) {
-    double z0 = now_sec();
-    int src_odp = 0;
+    /*
+     * RDSEND_ZEROCOPY_MR = odp (default) | pinned.
+     *   odp:    registration is immediate; worker threads fault the source in
+     *           and prefetch the NIC translation (ibv_advise_mr).
+     *   pinned: worker threads fault the source in, then the whole file is
+     *           pinned. Pinning 10 GiB can stall when the NUMA node is short
+     *           of memory, so it is opt-in.
+     * RDSEND_ZEROCOPY_THREADS = preparation threads (default 8).
+     */
+    const char *zm = getenv("RDSEND_ZEROCOPY_MR");
+    int want_pinned = zm && strcmp(zm, "pinned") == 0;
+    if (zm && *zm && !want_pinned && strcmp(zm, "odp") != 0) {
+      fprintf(stderr, "rdsend: RDSEND_ZEROCOPY_MR must be odp or pinned\n");
+      return EXIT_FAILURE;
+    }
+    int zthreads = 8;
+    const char *zt = getenv("RDSEND_ZEROCOPY_THREADS");
+    if (zt && *zt) zthreads = atoi(zt);
+    if (zthreads < 1) zthreads = 1;
+    if (zthreads > 64) zthreads = 64;
+
+    TS("zero-copy mmap start");
     src_map = mmap(NULL, (size_t)params.file_size, PROT_READ, MAP_SHARED, fd, 0);
-    if (src_map == MAP_FAILED) {
-      src_map = NULL;
-    } else {
-      /* Pinned first (static NIC translation); ODP if the kernel refuses. */
+    if (src_map == MAP_FAILED) src_map = NULL;
+    TS("zero-copy mmap done");
+    struct zc_prep z = { .base = src_map, .size = params.file_size, .chunk = buf_size,
+                         .pd = pd, .advise_ok = 1 };
+    double prep_s = 0.0, reg_s = 0.0;
+    if (src_map && want_pinned) {
+      TS("zero-copy populate start");
+      prep_s = zc_prepare(&z, zthreads);
+      TS("zero-copy populate done; pin start");
+      double r0 = now_sec();
       src_mr = ibv_reg_mr(pd, src_map, (size_t)params.file_size, 0);
-      if (!src_mr) {
-        src_odp = 1;
-        src_mr = ibv_reg_mr(pd, src_map, (size_t)params.file_size, IBV_ACCESS_ON_DEMAND);
+      reg_s = now_sec() - r0;
+      TS("zero-copy pin done");
+    } else if (src_map) {
+      TS("zero-copy ODP register start");
+      double r0 = now_sec();
+      src_mr = ibv_reg_mr(pd, src_map, (size_t)params.file_size, IBV_ACCESS_ON_DEMAND);
+      reg_s = now_sec() - r0;
+      TS("zero-copy ODP register done; prefetch start");
+      if (src_mr) {
+        z.mr = src_mr;
+        prep_s = zc_prepare(&z, zthreads);
       }
+      TS("zero-copy prefetch done");
     }
     if (!src_mr) {
       fprintf(stderr, "rdsend: zero-copy registration of the source failed (%s); "
@@ -651,9 +742,13 @@ int main(int argc, char *argv[]) {
       src_map = NULL;
       zerocopy = 0;
     } else if (verbose) {
-      fprintf(stderr, "Zero-copy source: %.2f GiB registered (%s) in %.3f s\n",
+      fprintf(stderr, "Zero-copy source: %.2f GiB, %s MR; populate%s %.3f s (%d threads), "
+              "register %.3f s%s%s\n",
               (double)params.file_size / (1024.0 * 1024.0 * 1024.0),
-              src_odp ? "ODP" : "pinned", now_sec() - z0);
+              want_pinned ? "pinned" : "ODP", want_pinned ? "" : " + prefetch",
+              prep_s, zthreads, reg_s,
+              z.touch_fallback ? " [touch fallback]" : "",
+              !want_pinned && !z.advise_ok ? " [no ibv_advise_mr]" : "");
     }
   }
 
