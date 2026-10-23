@@ -219,6 +219,76 @@ static double prefault_wait(struct prefault_ctx *pf, uint64_t seq) {
   return (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) * 1e-9;
 }
 
+/*
+ * Direct-write receive mode (disk destinations). The NIC receives into a ring
+ * of registered anonymous slots; writer threads write each slot to its file
+ * offset with O_DIRECT, so the device DMAs straight from the slot (no CPU copy
+ * and no page-cache writeback, which caps buffered XFS writes at ~1.7 GB/s
+ * from one thread). A slot is reused only after its chunk has been written,
+ * which is what throttles the sender to disk speed.
+ */
+struct dw_ctx {
+  int dfd, bfd, verbose;
+  char *base;
+  uint32_t buf_size, nslots;
+  uint64_t chunks, file_size;
+  uint64_t next;              /* ticket (atomic) */
+  uint64_t received;          /* chunks received so far (atomic) */
+  uint64_t *slot_written;     /* per slot: chunk+1 once written (atomic) */
+  int stop;                   /* atomic */
+  int err;                    /* errno of a failed write (atomic) */
+  uint64_t err_offset;
+  double busy_seconds;
+  uint64_t chunks_written;
+  pthread_mutex_t lock;
+};
+
+static void *dw_worker(void *arg) {
+  struct dw_ctx *d = arg;
+  double busy = 0.0;
+  uint64_t n = 0;
+  for (;;) {
+    uint64_t i = __atomic_fetch_add(&d->next, 1, __ATOMIC_ACQ_REL);
+    if (i >= d->chunks) break;
+    while (__atomic_load_n(&d->received, __ATOMIC_ACQUIRE) <= i) {
+      if (__atomic_load_n(&d->stop, __ATOMIC_ACQUIRE)) goto out;
+      sched_yield();
+    }
+    uint32_t slot = (uint32_t)(i % d->nslots);
+    uint64_t off = i * (uint64_t)d->buf_size;
+    size_t len = d->file_size - off < d->buf_size ? (size_t)(d->file_size - off) : d->buf_size;
+    char *src = d->base + (size_t)slot * d->buf_size;
+    double t0 = now_sec();
+    int rc;
+    if (d->dfd >= 0 && len == d->buf_size) {
+      rc = pwrite_full(d->dfd, src, len, (off_t)off);
+      if (rc != 0) {
+        if (d->verbose)
+          fprintf(stderr, "rdrecv: O_DIRECT write at %llu failed (%s); retrying buffered\n",
+                  (unsigned long long)off, strerror(errno));
+        rc = pwrite_full(d->bfd, src, len, (off_t)off);
+      }
+    } else {
+      /* Partial tail (unaligned length) or no O_DIRECT: buffered write. */
+      rc = pwrite_full(d->bfd, src, len, (off_t)off);
+    }
+    if (rc != 0) {
+      d->err_offset = off;
+      __atomic_store_n(&d->err, errno ? errno : EIO, __ATOMIC_RELEASE);
+      break;
+    }
+    busy += now_sec() - t0;
+    n++;
+    __atomic_store_n(&d->slot_written[slot], i + 1, __ATOMIC_RELEASE);
+  }
+out:
+  pthread_mutex_lock(&d->lock);
+  d->busy_seconds += busy;
+  d->chunks_written += n;
+  pthread_mutex_unlock(&d->lock);
+  return NULL;
+}
+
 /* Wait for one completion while using the completion channel safely. */
 static int wait_cq_completion(struct ibv_cq *cq,
                               struct ibv_comp_channel *channel,
@@ -422,6 +492,8 @@ int main(int argc, char *argv[]) {
   uint64_t data_slots  = 0;
   char  *file_map      = NULL;   /* non-NULL if using zero-copy */
   size_t file_map_size = 0;
+  int    direct_mode   = 0;      /* ring + O_DIRECT writer threads */
+  uint32_t dw_nslots   = 0;
 
   /* fallback ring state (used only when file_map == NULL) */
   void **slots      = NULL;
@@ -483,6 +555,66 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "fallocate: skipped%s\n", is_tmpfs ? " (tmpfs)" : "");
       }
     }
+    /*
+     * RDRECV_MODE = auto (default) | mmap | direct.
+     *   mmap:   the NIC writes straight into the mapped file (page cache).
+     *           Best for tmpfs; on disk filesystems buffered writeback caps
+     *           throughput (~13 Gb/s measured on XFS over a 10x NVMe RAID0).
+     *   direct: ring of registered slots + O_DIRECT writer threads.
+     *   auto:   mmap for tmpfs, direct otherwise.
+     */
+    {
+      const char *mode_env = getenv("RDRECV_MODE");
+      struct statfs sfs2;
+      int dest_tmpfs = fstatfs(fd, &sfs2) == 0 && sfs2.f_type == 0x01021994;
+      if (!mode_env || !*mode_env || strcmp(mode_env, "auto") == 0) direct_mode = !dest_tmpfs;
+      else if (strcmp(mode_env, "direct") == 0) direct_mode = 1;
+      else if (strcmp(mode_env, "mmap") == 0) direct_mode = 0;
+      else {
+        fprintf(stderr, "rdrecv: RDRECV_MODE must be auto, mmap or direct\n");
+        return EXIT_FAILURE;
+      }
+      if (direct_mode) {
+        direct_fd = open(filename, O_WRONLY | O_DIRECT);
+        if (direct_fd < 0) {
+          fprintf(stderr, "rdrecv: O_DIRECT unavailable on destination (%s); "
+                  "using mmap mode\n", strerror(errno));
+          direct_mode = 0;
+        }
+      }
+    }
+  }
+  if (params.file_size > 0 && direct_mode) {
+    /* RDRECV_WRITE_AHEAD: slots beyond the receive window that may be waiting
+     * for (or under) disk writes; default ring_size, at most 256 MiB. */
+    uint32_t wa = ring_size;
+    uint32_t wa_cap = (uint32_t)((256ULL * 1024 * 1024) / buf_size);
+    if (wa_cap < 2) wa_cap = 2;
+    if (wa > wa_cap) wa = wa_cap;
+    const char *wa_env = getenv("RDRECV_WRITE_AHEAD");
+    if (wa_env && *wa_env) wa = (uint32_t)strtoul(wa_env, NULL, 10);
+    if (wa < 1) wa = 1;
+    dw_nslots = ring_size + wa;
+    TS("direct ring mmap start");
+    rdma_buf_size = (size_t)buf_size * (dw_nslots + 2ULL);
+    rdma_buf = mmap(NULL, rdma_buf_size, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (rdma_buf == MAP_FAILED) {
+      fprintf(stderr, "rdrecv: mmap of %zu-byte receive ring failed: %s\n",
+              rdma_buf_size, strerror(errno));
+      return 1;
+    }
+    madvise(rdma_buf, rdma_buf_size, MADV_HUGEPAGE);
+    memset(rdma_buf, 0, rdma_buf_size);   /* fault in before pinning */
+    key_buf = rdma_buf + (size_t)dw_nslots * buf_size;
+    ack_buf = key_buf + buf_size;
+    TS("direct ring mmap done");
+    if (verbose)
+      fprintf(stderr, "Receive mode: direct (%u slots = %u window + %u write-ahead, %u MiB)\n",
+              dw_nslots, ring_size, wa,
+              (unsigned)((uint64_t)dw_nslots * buf_size / (1024U * 1024U)));
+  } else if (params.file_size > 0) {
+    if (verbose) fprintf(stderr, "Receive mode: mmap (NIC writes into the mapped file)\n");
     file_map = mmap(NULL, file_map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (file_map == MAP_FAILED) {
       fprintf(stderr, "rdrecv: mmap destination '%s' (%zu bytes) failed: %s\\n",
@@ -1019,6 +1151,229 @@ int main(int argc, char *argv[]) {
       return EXIT_FAILURE;
     }
     TS("munmap done");
+    TS("ftruncate start");
+    if (ftruncate(fd, (off_t)total_bytes) < 0) {
+      fprintf(stderr, "rdrecv: final ftruncate to %llu bytes failed: %s\n",
+              (unsigned long long)total_bytes, strerror(errno));
+      return EXIT_FAILURE;
+    }
+    TS("ftruncate done");
+
+  } else if (direct_mode) {
+    /*
+     * Direct-write path: receives land in ring slots (chunk k in slot
+     * k mod dw_nslots); writer threads write them with O_DIRECT. Before a
+     * slot is re-posted for chunk k, the chunk previously in it
+     * (k - dw_nslots) must be on disk.
+     */
+    const uint32_t window = ring_size;
+    const uint64_t data_chunks = data_slots;
+    if (verbose) fprintf(stderr, "RDMA pipeline depth: %u chunks (%u MiB each)\n",
+                         window, buf_size / (1024U * 1024U));
+    struct ibv_sge ack_sge = {
+      .addr=(uintptr_t)ack_buf, .length=1, .lkey=mr->lkey
+    };
+    struct ibv_send_wr ack_wr = {
+      .wr_id=WR_ID_ACK_BASE, .opcode=IBV_WR_SEND,
+      .send_flags=IBV_SEND_SIGNALED, .sg_list=&ack_sge, .num_sge=1
+    };
+    struct ibv_send_wr *bad_ack_wr;
+    uint64_t ack_pending = 0, next_to_post = 0, next_to_complete = 0;
+    int sentinel_posted = 0, sentinel_received = 0;
+    double write_wait = 0.0;
+
+    struct dw_ctx dw = {
+      .dfd = direct_fd, .bfd = fd, .verbose = verbose, .base = rdma_buf,
+      .buf_size = buf_size, .nslots = dw_nslots, .chunks = data_chunks,
+      .file_size = params.file_size, .lock = PTHREAD_MUTEX_INITIALIZER,
+    };
+    dw.slot_written = calloc(dw_nslots, sizeof(*dw.slot_written));
+    struct ibv_sge *data_sges = calloc(window, sizeof(*data_sges));
+    struct ibv_recv_wr *data_wrs = calloc(window, sizeof(*data_wrs));
+    if (!dw.slot_written || !data_sges || !data_wrs) {
+      fprintf(stderr, "rdrecv: out of memory\n");
+      return EXIT_FAILURE;
+    }
+    /* RDRECV_WRITE_THREADS: parallel O_DIRECT writers (default 8). */
+    int nwriters = 8;
+    const char *wt_env = getenv("RDRECV_WRITE_THREADS");
+    if (wt_env && *wt_env) nwriters = atoi(wt_env);
+    if (nwriters < 1) nwriters = 1;
+    if (nwriters > 64) nwriters = 64;
+    if ((uint32_t)nwriters > dw_nslots) nwriters = (int)dw_nslots;
+    pthread_t writers[64];
+    int nw_started = 0;
+    for (int i = 0; i < nwriters; ++i) {
+      if (pthread_create(&writers[i], NULL, dw_worker, &dw) != 0) break;
+      nw_started++;
+    }
+    if (nw_started == 0) {
+      fprintf(stderr, "rdrecv: failed to start writer threads\n");
+      return EXIT_FAILURE;
+    }
+    if (verbose) fprintf(stderr, "Writers: %d threads, O_DIRECT\n", nw_started);
+
+    if (wait_cq_completion(cq, comp_chan, &wc, &event_count) != 0 ||
+        wc.status != IBV_WC_SUCCESS || wc.opcode != IBV_WC_RECV ||
+        wc.wr_id != WR_ID_KEY) {
+      fprintf(stderr, "rdrecv: failed receiving authentication key\n");
+      return EXIT_FAILURE;
+    }
+    if (wc.byte_len != keylen + 1 || memcmp(key_buf, key, keylen + 1) != 0) {
+      fprintf(stderr, "Wrong key received\n");
+      return EXIT_FAILURE;
+    }
+    TS("transfer start (key verified)");
+    transfer_start = now_sec();
+    last_report_time = transfer_start;
+
+    for (uint32_t w = 0; w < window && next_to_post < data_chunks; ++w) {
+      data_sges[w].addr = (uintptr_t)(rdma_buf + (size_t)(next_to_post % dw_nslots) * buf_size);
+      data_sges[w].length = buf_size;
+      data_sges[w].lkey = mr->lkey;
+      data_wrs[w].wr_id = next_to_post;
+      data_wrs[w].sg_list = &data_sges[w];
+      data_wrs[w].num_sge = 1;
+      if (ibv_post_recv(qp, &data_wrs[w], &bad_recv_wr)) {
+        fprintf(stderr, "rdrecv: failed posting receive %llu: %s\n",
+                (unsigned long long)next_to_post, strerror(errno));
+        return EXIT_FAILURE;
+      }
+      next_to_post++;
+    }
+    if (next_to_post == data_chunks) {
+      sge.addr = (uintptr_t)key_buf;
+      sge.length = buf_size;
+      recv_wr.wr_id = WR_ID_SENTINEL;
+      if (ibv_post_recv(qp, &recv_wr, &bad_recv_wr)) {
+        fprintf(stderr, "rdrecv: failed posting final sentinel receive: %s\n", strerror(errno));
+        return EXIT_FAILURE;
+      }
+      sentinel_posted = 1;
+    }
+    if (ibv_post_send(qp, &ack_wr, &bad_ack_wr)) {
+      fprintf(stderr, "rdrecv: failed to acknowledge authentication key: %s\n", strerror(errno));
+      return EXIT_FAILURE;
+    }
+    ack_pending++;
+
+    int failed = 0;
+    while (!failed && (!sentinel_received || ack_pending != 0)) {
+      if (wait_cq_completion(cq, comp_chan, &wc, &event_count) != 0) {
+        fprintf(stderr, "rdrecv: waiting for completion failed: %s\n", strerror(errno));
+        failed = 1; break;
+      }
+      if (wc.status != IBV_WC_SUCCESS) {
+        fprintf(stderr, "rdrecv: completion failed: %s (vendor_err=%u, wr_id=%llu)\n",
+                ibv_wc_status_str(wc.status), wc.vendor_err, (unsigned long long)wc.wr_id);
+        failed = 1; break;
+      }
+      if (wc.opcode == IBV_WC_SEND) { if (ack_pending > 0) ack_pending--; continue; }
+      if (wc.opcode != IBV_WC_RECV) continue;
+
+      if (wc.wr_id == WR_ID_SENTINEL) {
+        if (wc.byte_len != 0) {
+          fprintf(stderr, "rdrecv: expected zero-length sentinel, got %u bytes\n", wc.byte_len);
+          failed = 1; break;
+        }
+        sentinel_received = 1;
+        transfer_end = now_sec();
+      } else {
+        uint64_t seq = wc.wr_id;
+        if (seq != next_to_complete || seq >= data_chunks) {
+          fprintf(stderr, "rdrecv: out-of-order data completion (got %llu, expected %llu)\n",
+                  (unsigned long long)seq, (unsigned long long)next_to_complete);
+          failed = 1; break;
+        }
+        uint64_t expected = params.file_size - seq * (uint64_t)buf_size;
+        if (expected > buf_size) expected = buf_size;
+        if (wc.byte_len != expected) {
+          fprintf(stderr, "rdrecv: chunk %llu length mismatch: got %u, expected %llu\n",
+                  (unsigned long long)seq, wc.byte_len, (unsigned long long)expected);
+          failed = 1; break;
+        }
+        total_bytes += wc.byte_len;
+        next_to_complete++;
+        __atomic_store_n(&dw.received, next_to_complete, __ATOMIC_RELEASE);
+        report_progress(verbose, total_bytes, transfer_start,
+                        &last_report_time, &last_report_bytes);
+
+        if (next_to_post < data_chunks) {
+          uint32_t rs = (uint32_t)(next_to_post % dw_nslots);
+          if (next_to_post >= dw_nslots) {
+            uint64_t need = next_to_post - dw_nslots + 1;
+            if (__atomic_load_n(&dw.slot_written[rs], __ATOMIC_ACQUIRE) != need) {
+              double w0 = now_sec();
+              while (__atomic_load_n(&dw.slot_written[rs], __ATOMIC_ACQUIRE) != need) {
+                if (__atomic_load_n(&dw.err, __ATOMIC_ACQUIRE)) break;
+                sched_yield();
+              }
+              write_wait += now_sec() - w0;
+            }
+          }
+          int werr = __atomic_load_n(&dw.err, __ATOMIC_ACQUIRE);
+          if (werr) {
+            fprintf(stderr, "rdrecv: destination write failed at offset %llu: %s\n",
+                    (unsigned long long)dw.err_offset, strerror(werr));
+            failed = 1; break;
+          }
+          uint32_t w = (uint32_t)(seq % window);
+          data_sges[w].addr = (uintptr_t)(rdma_buf + (size_t)rs * buf_size);
+          data_sges[w].length = buf_size;
+          data_wrs[w].wr_id = next_to_post;
+          if (ibv_post_recv(qp, &data_wrs[w], &bad_recv_wr)) {
+            fprintf(stderr, "rdrecv: failed replenishing receive window: %s\n", strerror(errno));
+            failed = 1; break;
+          }
+          next_to_post++;
+          if (next_to_post == data_chunks && !sentinel_posted) {
+            sge.addr = (uintptr_t)key_buf;
+            sge.length = buf_size;
+            recv_wr.wr_id = WR_ID_SENTINEL;
+            if (ibv_post_recv(qp, &recv_wr, &bad_recv_wr)) {
+              fprintf(stderr, "rdrecv: failed posting final sentinel receive: %s\n", strerror(errno));
+              failed = 1; break;
+            }
+            sentinel_posted = 1;
+          }
+        }
+      }
+      if (ibv_post_send(qp, &ack_wr, &bad_ack_wr)) {
+        fprintf(stderr, "rdrecv: failed posting ACK: %s\n", strerror(errno));
+        failed = 1; break;
+      }
+      ack_pending++;
+    }
+    TS("final sentinel received; transfer done");
+    TS("transfer data complete");
+    if (failed) __atomic_store_n(&dw.stop, 1, __ATOMIC_RELEASE);
+    TS("finalization start");
+    TS("waiting for writers");
+    double j0 = now_sec();
+    for (int i = 0; i < nw_started; ++i) pthread_join(writers[i], NULL);
+    double join_s = now_sec() - j0;
+    TS("writers done");
+    free(data_sges); free(data_wrs); free(dw.slot_written);
+    if (failed) return EXIT_FAILURE;
+    if (dw.err) {
+      fprintf(stderr, "rdrecv: destination write failed at offset %llu: %s\n",
+              (unsigned long long)dw.err_offset, strerror(dw.err));
+      return EXIT_FAILURE;
+    }
+    if (total_bytes != params.file_size) {
+      fprintf(stderr, "rdrecv: received %llu bytes, expected %llu\n",
+              (unsigned long long)total_bytes, (unsigned long long)params.file_size);
+      return EXIT_FAILURE;
+    }
+    if (verbose) {
+      fprintf(stderr, "Write backpressure (receive slot waited on disk write): %.3f s\n",
+              write_wait);
+      if (dw.busy_seconds > 0)
+        fprintf(stderr, "Writer: %d threads, %.3f s busy in total, %.2f GB/s per thread; "
+                "last writes after sentinel %.3f s\n",
+                nw_started, dw.busy_seconds,
+                (double)dw.chunks_written * buf_size / dw.busy_seconds / 1e9, join_s);
+    }
     TS("ftruncate start");
     if (ftruncate(fd, (off_t)total_bytes) < 0) {
       fprintf(stderr, "rdrecv: final ftruncate to %llu bytes failed: %s\n",
