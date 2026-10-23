@@ -42,6 +42,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <time.h>
 #include <unistd.h>
 #include <omp.h>
@@ -309,6 +311,45 @@ static int qp_timeout_from_env(void) {
   long v = strtol(t, &end, 10);
   if (*end != '\0' || v < 1 || v > 30) return -1;
   return (int)v;
+}
+
+/*
+ * Auto-configuration from the path RTT. The kernel's TCP RTT estimate for the
+ * control connection (TCP_INFO) is used, so no extra protocol messages are
+ * needed. RDMA_AUTO=0 disables it (fixed defaults).
+ */
+static double tcp_rtt_ms(int sock) {
+  struct tcp_info ti;
+  socklen_t len = sizeof(ti);
+  memset(&ti, 0, sizeof(ti));
+  if (getsockopt(sock, IPPROTO_TCP, TCP_INFO, &ti, &len) != 0) return -1.0;
+  return ti.tcpi_rtt / 1000.0;   /* microseconds -> ms */
+}
+
+static int auto_enabled(void) {
+  const char *a = getenv("RDMA_AUTO");
+  return !(a && (strcmp(a, "0") == 0 || strcmp(a, "off") == 0));
+}
+
+/* Smallest exponent >= 14 whose ACK timeout (4.096 us * 2^N) is >= 2 x RTT. */
+static int qp_timeout_for_rtt(double rtt_ms) {
+  int n = 14;
+  while (n < 30 && 4.096e-3 * (double)(1UL << n) < 2.0 * rtt_ms) n++;
+  return n;
+}
+
+/* Explicit RDMA_QP_TIMEOUT wins; otherwise derived from the RTT (or 14). */
+static int choose_qp_timeout(double rtt, int verbose) {
+  int t = qp_timeout_from_env();
+  if (t < 0) return -1;
+  const char *env = getenv("RDMA_QP_TIMEOUT");
+  const char *why = "default";
+  if (env && *env) why = "RDMA_QP_TIMEOUT";
+  else if (auto_enabled() && rtt >= 0) { t = qp_timeout_for_rtt(rtt); why = "auto: >= 2 x TCP RTT"; }
+  if (verbose)
+    fprintf(stderr, "QP ACK timeout: %d (%.1f ms; %s; TCP RTT %.3f ms)\n", t,
+            4.096e-3 * (double)(1UL << t), why, rtt);
+  return t;
 }
 
 /* Wait for one completion while using the completion channel safely. */
@@ -715,12 +756,21 @@ int main(int argc, char *argv[]) {
    *        fall back to ODP). Pages are populated by worker threads first,
    *        because pinning alone would fault 10 GiB in from one thread.
    */
+  /*
+   * RDRECV_ODP default `auto`: pinned for tmpfs destinations (the file must
+   * fit in RAM anyway, and the pinned MR measured 97 Gb/s against 79 Gb/s
+   * with ODP + ahead prefault), ODP otherwise.
+   */
   int use_odp = file_map != NULL;
   if (file_map != NULL) {
     const char *o = getenv("RDRECV_ODP");
-    if (o && (strcmp(o, "off") == 0 || strcmp(o, "0") == 0)) use_odp = 0;
-    else if (o && *o && strcmp(o, "on") != 0 && strcmp(o, "1") != 0) {
-      fprintf(stderr, "rdrecv: RDRECV_ODP must be on or off\n");
+    struct statfs sfs3;
+    int dst_tmpfs = fstatfs(fd, &sfs3) == 0 && sfs3.f_type == 0x01021994;
+    if (!o || !*o || strcmp(o, "auto") == 0) use_odp = !dst_tmpfs;
+    else if (strcmp(o, "off") == 0 || strcmp(o, "0") == 0) use_odp = 0;
+    else if (strcmp(o, "on") == 0 || strcmp(o, "1") == 0) use_odp = 1;
+    else {
+      fprintf(stderr, "rdrecv: RDRECV_ODP must be auto, on or off\n");
       return EXIT_FAILURE;
     }
   }
@@ -888,6 +938,8 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "rdrecv: TCP QP handshake read failed: %s\n", errno ? strerror(errno) : "peer closed connection before sending the full structure");
     return 1;
   }
+  /* Read the RTT while the control socket is still open (more samples now). */
+  double ctrl_rtt_ms = tcp_rtt_ms(tcp_sock);
   close(tcp_sock);
 
   struct ibv_qp_attr rtr_attr = {
@@ -905,14 +957,11 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  int qp_timeout = qp_timeout_from_env();
+  int qp_timeout = choose_qp_timeout(ctrl_rtt_ms, verbose);
   if (qp_timeout < 0) {
     fprintf(stderr, "rdrecv: invalid RDMA_QP_TIMEOUT (expected integer 1..30)\n");
     return EXIT_FAILURE;
   }
-  if (verbose)
-    fprintf(stderr, "QP ACK timeout: %d (%.1f ms)\n", qp_timeout,
-            4.096e-3 * (double)(1UL << qp_timeout));
   struct ibv_qp_attr rts_attr = {
     .qp_state=IBV_QPS_RTS, .timeout=(uint8_t)qp_timeout, .retry_cnt=7, .rnr_retry=7,
     .sq_psn=local_psn, .max_rd_atomic=1,

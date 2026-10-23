@@ -137,7 +137,9 @@ Sender (`rdsend`, sent to the receiver during the handshake):
 |---|---|---|
 | `RDMA_BUF_SIZE` | 32 | Chunk size in MiB |
 | `RDMA_RING_SIZE` | 4 | Chunks in flight (2..256). With smaller chunks (e.g. `RDMA_BUF_SIZE=4`) use a deeper window. |
-| `RDMA_QP_TIMEOUT` | 14 | RC ACK timeout exponent (4.096 µs × 2^N, 1..30), set on both sides. 14 ≈ 67 ms suits a LAN; on long-haul links use a timeout of at least ~2× the RTT (17 ≈ 537 ms for 115 ms). |
+| `RDMA_AUTO` | on | Auto-configuration from the control connection's TCP RTT (kernel `TCP_INFO`): the sender sizes the window (`RDMA_BUF_SIZE` × `RDMA_RING_SIZE` ≥ 1.5 × link rate × RTT; 4 MiB × 64 up to ~10 ms at 100G, then 16 MiB chunks) and each side picks `RDMA_QP_TIMEOUT` ≥ 2 × RTT. Explicit variables always win. `RDMA_AUTO=0` restores fixed defaults (32 MiB × 4, timeout 14). |
+| `RDMA_LINK_GBPS` | interface speed | Link rate used by the auto window, when the interface speed is unknown (e.g. some VLAN devices) or a path is slower than the NIC. |
+| `RDMA_QP_TIMEOUT` | auto (14 on a LAN) | RC ACK timeout exponent (4.096 µs × 2^N, 1..30), set on both sides. 14 ≈ 67 ms suits a LAN; on long-haul links use a timeout of at least ~2× the RTT (17 ≈ 537 ms for 115 ms). |
 | `RDSEND_READ_AHEAD` | ring size, at most 256 MiB | Extra send slots filled ahead of the in-flight window, so file reads overlap with RDMA sends (0..64). |
 | `RDSEND_ZEROCOPY` | `auto` | Send chunks straight from the mapped source file, with no read copy and no reader threads. `auto` = on for tmpfs/shmem sources only; `on` / `off` force it. |
 | `RDSEND_ZEROCOPY_MR` | `odp` | Zero-copy source registration: `odp` (immediate; threads prefetch) or `pinned` (threads populate, then the file is pinned). |
@@ -153,7 +155,7 @@ Receiver (`rdrecv`, zero-copy file path):
 | `RDRECV_MODE` | `auto` | `mmap`: the NIC writes straight into the mapped destination (best for tmpfs). `direct`: receive into a ring of registered slots and write them with `O_DIRECT` writer threads (disk destinations; avoids buffered writeback). `auto` = mmap for tmpfs, direct otherwise. |
 | `RDRECV_WRITE_THREADS` | 8 | `direct` mode: parallel `O_DIRECT` writer threads. |
 | `RDRECV_WRITE_AHEAD` | ring size, at most 256 MiB | `direct` mode: slots beyond the receive window that can be waiting for or under disk writes. |
-| `RDRECV_ODP` | `on` | `on`: register the destination with On-Demand Paging. `off`: populate it with the prefault threads and pin it (classic registration); works on tmpfs, falls back to ODP where the kernel refuses to pin file pages. |
+| `RDRECV_ODP` | `auto` | `auto`: pinned for tmpfs destinations, ODP otherwise. `on`: register the destination with On-Demand Paging. `off`: populate it with the prefault threads and pin it (classic registration); works on tmpfs, falls back to ODP where the kernel refuses to pin file pages. |
 | `RDRECV_PREFAULT` | `ahead` | `ahead`: worker threads allocate destination pages and prefetch NIC translations ahead of the receive window. `upfront`: do it for the whole file before the transfer (reported as setup). `off`: let ODP fault pages in during the transfer. |
 | `RDRECV_PREFAULT_THREADS` | 8 | Prefault worker threads. |
 | `RDRECV_PREFAULT_AHEAD` | 64 | Maximum chunks prefaulted beyond the last completed one (`0` = unlimited). |
