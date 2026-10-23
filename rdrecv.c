@@ -756,12 +756,21 @@ int main(int argc, char *argv[]) {
    *        fall back to ODP). Pages are populated by worker threads first,
    *        because pinning alone would fault 10 GiB in from one thread.
    */
+  /*
+   * RDRECV_ODP default `auto`: pinned for tmpfs destinations (the file must
+   * fit in RAM anyway, and the pinned MR measured 97 Gb/s against 79 Gb/s
+   * with ODP + ahead prefault), ODP otherwise.
+   */
   int use_odp = file_map != NULL;
   if (file_map != NULL) {
     const char *o = getenv("RDRECV_ODP");
-    if (o && (strcmp(o, "off") == 0 || strcmp(o, "0") == 0)) use_odp = 0;
-    else if (o && *o && strcmp(o, "on") != 0 && strcmp(o, "1") != 0) {
-      fprintf(stderr, "rdrecv: RDRECV_ODP must be on or off\n");
+    struct statfs sfs3;
+    int dst_tmpfs = fstatfs(fd, &sfs3) == 0 && sfs3.f_type == 0x01021994;
+    if (!o || !*o || strcmp(o, "auto") == 0) use_odp = !dst_tmpfs;
+    else if (strcmp(o, "off") == 0 || strcmp(o, "0") == 0) use_odp = 0;
+    else if (strcmp(o, "on") == 0 || strcmp(o, "1") == 0) use_odp = 1;
+    else {
+      fprintf(stderr, "rdrecv: RDRECV_ODP must be auto, on or off\n");
       return EXIT_FAILURE;
     }
   }

@@ -155,7 +155,7 @@ Receiver (`rdrecv`, zero-copy file path):
 | `RDRECV_MODE` | `auto` | `mmap`: the NIC writes straight into the mapped destination (best for tmpfs). `direct`: receive into a ring of registered slots and write them with `O_DIRECT` writer threads (disk destinations; avoids buffered writeback). `auto` = mmap for tmpfs, direct otherwise. |
 | `RDRECV_WRITE_THREADS` | 8 | `direct` mode: parallel `O_DIRECT` writer threads. |
 | `RDRECV_WRITE_AHEAD` | ring size, at most 256 MiB | `direct` mode: slots beyond the receive window that can be waiting for or under disk writes. |
-| `RDRECV_ODP` | `on` | `on`: register the destination with On-Demand Paging. `off`: populate it with the prefault threads and pin it (classic registration); works on tmpfs, falls back to ODP where the kernel refuses to pin file pages. |
+| `RDRECV_ODP` | `auto` | `auto`: pinned for tmpfs destinations, ODP otherwise. `on`: register the destination with On-Demand Paging. `off`: populate it with the prefault threads and pin it (classic registration); works on tmpfs, falls back to ODP where the kernel refuses to pin file pages. |
 | `RDRECV_PREFAULT` | `ahead` | `ahead`: worker threads allocate destination pages and prefetch NIC translations ahead of the receive window. `upfront`: do it for the whole file before the transfer (reported as setup). `off`: let ODP fault pages in during the transfer. |
 | `RDRECV_PREFAULT_THREADS` | 8 | Prefault worker threads. |
 | `RDRECV_PREFAULT_AHEAD` | 64 | Maximum chunks prefaulted beyond the last completed one (`0` = unlimited). |
