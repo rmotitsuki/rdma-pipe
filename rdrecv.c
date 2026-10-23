@@ -138,7 +138,13 @@ static double now_sec(void) {
   clock_gettime(CLOCK_MONOTONIC, &t);
   return t.tv_sec + t.tv_nsec * 1e-9;
 }
-#define TS(label) do { if (verbose) fprintf(stderr, "TS %.3f %s\n", now_sec() - _ts0, label); } while(0)
+/*
+ * Timestamps are relative to the current phase, not to process start:
+ *   "setup"    from the moment the sender connected (waiting for the sender
+ *              is reported once, separately);
+ *   "transfer" from the moment the key was verified (the transfer clock).
+ */
+#define TS(label) do { if (verbose) fprintf(stderr, "TS %-8s %7.3f s  %s\n", _ts_phase, now_sec() - _ts_ref, label); } while(0)
 
 #ifndef MADV_POPULATE_WRITE
 #define MADV_POPULATE_WRITE 23
@@ -391,6 +397,8 @@ static struct ibv_context *find_rdma_device_by_ip(uint32_t local_ip,
 
 int main(int argc, char *argv[]) {
   double _ts0 = now_sec();
+  double _ts_ref = _ts0;
+  const char *_ts_phase = "setup";
 
   int verbose = 0, argv_idx = 1;
   if (argc < 4) { fprintf(stderr, "USAGE: rdrecv [-v] <port> <key> <filename>\n"); return 1; }
@@ -452,6 +460,14 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "rdrecv: accept failed: %s\n", strerror(errno));
     close(fd);
     return EXIT_FAILURE;
+  }
+  double connect_time = now_sec();
+  _ts_ref = connect_time;
+  if (verbose) {
+    char peer_ip[INET_ADDRSTRLEN] = "?";
+    inet_ntop(AF_INET, &peer_addr.sin_addr, peer_ip, sizeof(peer_ip));
+    fprintf(stderr, "Sender %s connected after waiting %.3f s\n",
+            peer_ip, connect_time - _ts0);
   }
 
   struct rdma_params params;
@@ -962,6 +978,7 @@ int main(int argc, char *argv[]) {
     }
     TS("transfer start (key verified)");
     transfer_start = now_sec();
+    _ts_ref = transfer_start; _ts_phase = "transfer";
     last_report_time = transfer_start;
     struct ibv_sge *data_sges = calloc(window, sizeof(*data_sges));
     struct ibv_recv_wr *data_wrs = calloc(window, sizeof(*data_wrs));
@@ -1226,6 +1243,7 @@ int main(int argc, char *argv[]) {
     }
     TS("transfer start (key verified)");
     transfer_start = now_sec();
+    _ts_ref = transfer_start; _ts_phase = "transfer";
     last_report_time = transfer_start;
 
     for (uint32_t w = 0; w < window && next_to_post < data_chunks; ++w) {
@@ -1429,6 +1447,7 @@ int main(int argc, char *argv[]) {
         if (key_was_pending && keyIdx == keylen + 1) {
           TS("transfer start (key verified)");
           transfer_start = now_sec();
+          _ts_ref = transfer_start; _ts_phase = "transfer";
           last_report_time = transfer_start;
         }
         if (i == 0 && msgLen > 0) {
@@ -1493,8 +1512,9 @@ int main(int argc, char *argv[]) {
     if (transfer_start == 0.0) transfer_start = transfer_end; /* key never seen */
     double xfer_seconds = transfer_end - transfer_start;
     double durable_seconds = persist_end - transfer_start;
-    fprintf(stderr, "Setup time (process start -> transfer start): %.3f s\n",
-            transfer_start - _ts0);
+    fprintf(stderr, "Setup time (sender connected -> transfer start): %.3f s "
+            "(plus %.3f s waiting for the sender)\n",
+            transfer_start - connect_time, connect_time - _ts0);
     fprintf(stderr, "Transfer time (elapsed): %.3f s\n", xfer_seconds);
     fprintf(stderr, "Transferred: %llu bytes (%.2f GiB)\n", (unsigned long long)total_bytes,
             (double)total_bytes / (1024.0 * 1024.0 * 1024.0));
@@ -1530,6 +1550,7 @@ int main(int argc, char *argv[]) {
     munmap(rdma_buf, rdma_buf_size);
 
   TS("resource cleanup done");
-  if (verbose) fprintf(stderr, "Total command time: %.3f s\n", now_sec() - _ts0);
+  if (verbose) fprintf(stderr, "Total command time: %.3f s (%.3f s of it waiting for the sender)\n",
+                       now_sec() - _ts0, connect_time - _ts0);
   return 0;
 }
