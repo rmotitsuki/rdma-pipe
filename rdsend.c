@@ -44,6 +44,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/vfs.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <ifaddrs.h>
 #include <time.h>
 #include <unistd.h>
 #include <omp.h>
@@ -432,6 +435,71 @@ static int qp_timeout_from_env(void) {
   return (int)v;
 }
 
+/*
+ * Auto-configuration from the path RTT. The kernel's TCP RTT estimate for the
+ * control connection (TCP_INFO) is used, so no extra protocol messages are
+ * needed. RDMA_AUTO=0 disables it (fixed defaults).
+ */
+static double tcp_rtt_ms(int sock) {
+  struct tcp_info ti;
+  socklen_t len = sizeof(ti);
+  memset(&ti, 0, sizeof(ti));
+  if (getsockopt(sock, IPPROTO_TCP, TCP_INFO, &ti, &len) != 0) return -1.0;
+  return ti.tcpi_rtt / 1000.0;   /* microseconds -> ms */
+}
+
+static int auto_enabled(void) {
+  const char *a = getenv("RDMA_AUTO");
+  return !(a && (strcmp(a, "0") == 0 || strcmp(a, "off") == 0));
+}
+
+/* Smallest exponent >= 14 whose ACK timeout (4.096 us * 2^N) is >= 2 x RTT. */
+static int qp_timeout_for_rtt(double rtt_ms) {
+  int n = 14;
+  while (n < 30 && 4.096e-3 * (double)(1UL << n) < 2.0 * rtt_ms) n++;
+  return n;
+}
+
+/* Explicit RDMA_QP_TIMEOUT wins; otherwise derived from the RTT (or 14). */
+static int choose_qp_timeout(int sock, int verbose) {
+  int t = qp_timeout_from_env();
+  if (t < 0) return -1;
+  const char *env = getenv("RDMA_QP_TIMEOUT");
+  double rtt = tcp_rtt_ms(sock);
+  const char *why = "default";
+  if (env && *env) why = "RDMA_QP_TIMEOUT";
+  else if (auto_enabled() && rtt >= 0) { t = qp_timeout_for_rtt(rtt); why = "auto: >= 2 x TCP RTT"; }
+  if (verbose)
+    fprintf(stderr, "QP ACK timeout: %d (%.1f ms; %s; TCP RTT %.3f ms)\n", t,
+            4.096e-3 * (double)(1UL << t), why, rtt);
+  return t;
+}
+
+/* Speed of the interface that owns the local address of `sock`, in Gb/s
+ * (from /sys/class/net/<if>/speed); -1 if unknown (e.g. some VLAN devices). */
+static double link_gbps_for_socket(int sock, char *ifname, size_t ifname_len) {
+  struct sockaddr_in la;
+  socklen_t ll = sizeof(la);
+  if (getsockname(sock, (struct sockaddr *)&la, &ll) != 0) return -1.0;
+  struct ifaddrs *ifs = NULL, *it;
+  if (getifaddrs(&ifs) != 0) return -1.0;
+  double gbps = -1.0;
+  for (it = ifs; it; it = it->ifa_next) {
+    if (!it->ifa_addr || it->ifa_addr->sa_family != AF_INET) continue;
+    if (((struct sockaddr_in *)it->ifa_addr)->sin_addr.s_addr != la.sin_addr.s_addr) continue;
+    snprintf(ifname, ifname_len, "%s", it->ifa_name);
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/class/net/%s/speed", it->ifa_name);
+    FILE *f = fopen(path, "r");
+    long mbps = -1;
+    if (f) { if (fscanf(f, "%ld", &mbps) != 1) mbps = -1; fclose(f); }
+    if (mbps > 0) gbps = mbps / 1000.0;
+    break;
+  }
+  freeifaddrs(ifs);
+  return gbps;
+}
+
 /* Wait for one completion while using the completion channel safely. */
 static int wait_cq_completion(struct ibv_cq *cq,
                               struct ibv_comp_channel *channel,
@@ -522,6 +590,7 @@ int main(int argc, char *argv[]) {
       .buf_size  = 32 * 1024 * 1024,
       .ring_size = 4,
   };
+  int buf_from_env = 0, ring_from_env = 0;
   const char *bs_env = getenv("RDMA_BUF_SIZE");
   if (bs_env) {
     char *end = NULL;
@@ -533,6 +602,7 @@ int main(int argc, char *argv[]) {
       return EXIT_FAILURE;
     }
     params.buf_size = (uint32_t)mb * 1024U * 1024U;
+    buf_from_env = 1;
   }
   const char *rs_env = getenv("RDMA_RING_SIZE");
   if (rs_env) {
@@ -545,8 +615,8 @@ int main(int argc, char *argv[]) {
       return EXIT_FAILURE;
     }
     params.ring_size = (uint32_t)ring;
+    ring_from_env = 1;
   }
-  uint32_t buf_size = params.buf_size;
 
   int fd = STDIN_FILENO;
   int direct_fd = -1;
@@ -634,6 +704,61 @@ int main(int argc, char *argv[]) {
     }
     nanosleep((const struct timespec[]){{0, 10000000L}}, NULL);
   }
+
+  /*
+   * Window auto-configuration: buf_size x ring_size >= 1.5 x BDP, where
+   * BDP = link rate x TCP RTT. Explicit RDMA_BUF_SIZE / RDMA_RING_SIZE win.
+   * RDMA_LINK_GBPS overrides the link rate (default: interface speed, or 100).
+   */
+  {
+    double rtt = tcp_rtt_ms(tcp_sock);
+    char ifname[64] = "?";
+    double gbps = link_gbps_for_socket(tcp_sock, ifname, sizeof(ifname));
+    const char *lg = getenv("RDMA_LINK_GBPS");
+    const char *rate_src = "interface speed";
+    if (lg && *lg && atof(lg) > 0) { gbps = atof(lg); rate_src = "RDMA_LINK_GBPS"; }
+    else if (gbps <= 0) { gbps = 100.0; rate_src = "assumed; set RDMA_LINK_GBPS"; }
+    double bdp = rtt > 0 ? gbps * 1e9 / 8.0 * rtt / 1000.0 : 0.0;
+    double target = 1.5 * bdp;
+    const double MiB = 1024.0 * 1024.0;
+    const char *how = "defaults (RDMA_AUTO=0)";
+    if (auto_enabled() && !buf_from_env && !ring_from_env) {
+      if (target <= 256.0 * MiB) {
+        params.buf_size = 4U * 1024U * 1024U;
+        params.ring_size = 64;
+      } else {
+        params.buf_size = 16U * 1024U * 1024U;
+        double r = target / (16.0 * MiB);
+        params.ring_size = r > 224.0 ? 224U : (uint32_t)r + 1U;
+      }
+      how = "auto";
+    } else if (auto_enabled() && buf_from_env && !ring_from_env) {
+      double r = (target > 256.0 * MiB ? target : 256.0 * MiB) / params.buf_size;
+      params.ring_size = r > 256.0 ? 256U : (r < 2.0 ? 2U : (uint32_t)r + 1U);
+      if (params.ring_size > 256U) params.ring_size = 256U;
+      how = "auto ring for RDMA_BUF_SIZE";
+    } else if (auto_enabled() && !buf_from_env && ring_from_env) {
+      double b = (target > 256.0 * MiB ? target : 256.0 * MiB) / params.ring_size / MiB;
+      uint32_t mb = b < 1.0 ? 1U : (uint32_t)b + 1U;
+      if (mb > 2047U) mb = 2047U;
+      params.buf_size = mb * 1024U * 1024U;
+      how = "auto chunk size for RDMA_RING_SIZE";
+    } else if (buf_from_env && ring_from_env) {
+      how = "RDMA_BUF_SIZE x RDMA_RING_SIZE";
+    }
+    double window = (double)params.buf_size * params.ring_size;
+    if (verbose) {
+      fprintf(stderr, "Path: TCP RTT %.3f ms, link %.0f Gb/s (%s, %s), BDP %.1f MB\n",
+              rtt, gbps, ifname, rate_src, bdp / 1e6);
+      fprintf(stderr, "Window: %u MiB x %u = %.0f MiB (%s)\n",
+              params.buf_size / (1024U * 1024U), params.ring_size, window / MiB, how);
+    }
+    if (rtt > 0 && window < bdp)
+      fprintf(stderr, "rdsend: warning: window %.0f MiB is smaller than the BDP (%.0f MiB); "
+              "throughput is capped near %.1f Gb/s\n",
+              window / MiB, bdp / MiB, window * 8.0 / (rtt / 1000.0) / 1e9);
+  }
+  uint32_t buf_size = params.buf_size;
 
   int params_sent = write_full(tcp_sock, &params, sizeof(params));
   if (params_sent != 0) {
@@ -847,14 +972,11 @@ int main(int argc, char *argv[]) {
   }
 
   // Move QP to RTS
-  int qp_timeout = qp_timeout_from_env();
+  int qp_timeout = choose_qp_timeout(tcp_sock, verbose);
   if (qp_timeout < 0) {
     fprintf(stderr, "rdsend: invalid RDMA_QP_TIMEOUT (expected integer 1..30)\n");
     return EXIT_FAILURE;
   }
-  if (verbose)
-    fprintf(stderr, "QP ACK timeout: %d (%.1f ms)\n", qp_timeout,
-            4.096e-3 * (double)(1UL << qp_timeout));
   struct ibv_qp_attr rts_attr = {
       .qp_state = IBV_QPS_RTS,
       .timeout = (uint8_t)qp_timeout,
