@@ -136,7 +136,8 @@ Sender (`rdsend`, sent to the receiver during the handshake):
 | Variable | Default | Meaning |
 |---|---|---|
 | `RDMA_BUF_SIZE` | 32 | Chunk size in MiB |
-| `RDMA_RING_SIZE` | 4 | Chunks in flight (2..64). With smaller chunks (e.g. `RDMA_BUF_SIZE=4`) use a deeper window. |
+| `RDMA_RING_SIZE` | 4 | Chunks in flight (2..256). With smaller chunks (e.g. `RDMA_BUF_SIZE=4`) use a deeper window. |
+| `RDMA_QP_TIMEOUT` | 14 | RC ACK timeout exponent (4.096 µs × 2^N, 1..30), set on both sides. 14 ≈ 67 ms suits a LAN; on long-haul links use a timeout of at least ~2× the RTT (17 ≈ 537 ms for 115 ms). |
 | `RDSEND_READ_AHEAD` | ring size, at most 256 MiB | Extra send slots filled ahead of the in-flight window, so file reads overlap with RDMA sends (0..64). |
 | `RDSEND_ZEROCOPY` | `auto` | Send chunks straight from the mapped source file, with no read copy and no reader threads. `auto` = on for tmpfs/shmem sources only; `on` / `off` force it. |
 | `RDSEND_ZEROCOPY_MR` | `odp` | Zero-copy source registration: `odp` (immediate; threads prefetch) or `pinned` (threads populate, then the file is pinned). |

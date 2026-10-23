@@ -295,6 +295,22 @@ out:
   return NULL;
 }
 
+/*
+ * RDMA_QP_TIMEOUT: RC local ACK timeout exponent, 4.096 us * 2^N (1..30).
+ * The default 14 (~67 ms) is fine on a LAN but shorter than a long-haul RTT,
+ * which causes spurious retransmissions; use a value whose timeout is at
+ * least ~2x the RTT (e.g. 17 = ~537 ms for a 115 ms RTT). Set it on both
+ * sides; each side applies it to its own QP.
+ */
+static int qp_timeout_from_env(void) {
+  const char *t = getenv("RDMA_QP_TIMEOUT");
+  if (!t || !*t) return 14;
+  char *end = NULL;
+  long v = strtol(t, &end, 10);
+  if (*end != '\0' || v < 1 || v > 30) return -1;
+  return (int)v;
+}
+
 /* Wait for one completion while using the completion channel safely. */
 static int wait_cq_completion(struct ibv_cq *cq,
                               struct ibv_comp_channel *channel,
@@ -480,8 +496,8 @@ int main(int argc, char *argv[]) {
   uint32_t buf_size  = params.buf_size;
   uint32_t ring_size = params.ring_size < 2 ? 2 : params.ring_size;
   int direct_fd = -1;
-  if (ring_size > 64) {
-    fprintf(stderr, "rdrecv: unsupported pipeline depth %u (maximum 64)\n", ring_size);
+  if (ring_size > 256) {
+    fprintf(stderr, "rdrecv: unsupported pipeline depth %u (maximum 256)\n", ring_size);
     close(tcp_sock); close(fd);
     return EXIT_FAILURE;
   }
@@ -889,8 +905,16 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  int qp_timeout = qp_timeout_from_env();
+  if (qp_timeout < 0) {
+    fprintf(stderr, "rdrecv: invalid RDMA_QP_TIMEOUT (expected integer 1..30)\n");
+    return EXIT_FAILURE;
+  }
+  if (verbose)
+    fprintf(stderr, "QP ACK timeout: %d (%.1f ms)\n", qp_timeout,
+            4.096e-3 * (double)(1UL << qp_timeout));
   struct ibv_qp_attr rts_attr = {
-    .qp_state=IBV_QPS_RTS, .timeout=14, .retry_cnt=7, .rnr_retry=7,
+    .qp_state=IBV_QPS_RTS, .timeout=(uint8_t)qp_timeout, .retry_cnt=7, .rnr_retry=7,
     .sq_psn=local_psn, .max_rd_atomic=1,
   };
   if (ibv_modify_qp(qp, &rts_attr,
