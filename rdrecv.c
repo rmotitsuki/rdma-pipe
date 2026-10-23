@@ -326,9 +326,10 @@ static void report_progress(int verbose, uint64_t total_bytes,
   double average_mib_s = elapsed > 0.0
       ? (double)total_bytes / elapsed / (1024.0 * 1024.0) : 0.0;
   fprintf(stderr,
-          "Progress: %.2f GiB received; elapsed %.1f s; %.1f MiB/s (avg %.1f MiB/s)\n",
+          "Progress: %.2f GiB received; elapsed %.1f s; %.1f Gb/s (avg %.1f Gb/s; %.0f MiB/s)\n",
           (double)total_bytes / (1024.0 * 1024.0 * 1024.0), elapsed,
-          interval_mib_s, average_mib_s);
+          interval_mib_s * 1048576.0 * 8.0 / 1e9,
+          average_mib_s * 1048576.0 * 8.0 / 1e9, average_mib_s);
   *last_report_time = now;
   *last_report_bytes = total_bytes;
 }
@@ -1369,10 +1370,11 @@ int main(int argc, char *argv[]) {
       fprintf(stderr, "Write backpressure (receive slot waited on disk write): %.3f s\n",
               write_wait);
       if (dw.busy_seconds > 0)
-        fprintf(stderr, "Writer: %d threads, %.3f s busy in total, %.2f GB/s per thread; "
+        fprintf(stderr, "Writer: %d threads, %.3f s busy in total, %.2f GB/s (%.1f Gb/s) per thread; "
                 "last writes after sentinel %.3f s\n",
                 nw_started, dw.busy_seconds,
-                (double)dw.chunks_written * buf_size / dw.busy_seconds / 1e9, join_s);
+                (double)dw.chunks_written * buf_size / dw.busy_seconds / 1e9,
+                (double)dw.chunks_written * buf_size * 8.0 / dw.busy_seconds / 1e9, join_s);
     }
     TS("ftruncate start");
     if (ftruncate(fd, (off_t)total_bytes) < 0) {
@@ -1494,14 +1496,17 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "Setup time (process start -> transfer start): %.3f s\n",
             transfer_start - _ts0);
     fprintf(stderr, "Transfer time (elapsed): %.3f s\n", xfer_seconds);
-    fprintf(stderr, "Transferred: %llu bytes\n", (unsigned long long)total_bytes);
-    fprintf(stderr, "Bandwidth %.3f GB/s\n",
-            xfer_seconds > 0 ? (total_bytes / xfer_seconds) / 1e9 : 0.0);
+    fprintf(stderr, "Transferred: %llu bytes (%.2f GiB)\n", (unsigned long long)total_bytes,
+            (double)total_bytes / (1024.0 * 1024.0 * 1024.0));
+    fprintf(stderr, "Bandwidth %.3f GB/s = %.2f Gb/s\n",
+            xfer_seconds > 0 ? (total_bytes / xfer_seconds) / 1e9 : 0.0,
+            xfer_seconds > 0 ? (total_bytes * 8.0 / xfer_seconds) / 1e9 : 0.0);
     fprintf(stderr, "Finalization time (sentinel -> fdatasync done): %.3f s "
             "(fdatasync %.3f s)\n", persist_end - transfer_end, persist_seconds);
-    fprintf(stderr, "Transfer + persistence time: %.3f s; durable bandwidth %.3f GB/s\n",
+    fprintf(stderr, "Transfer + persistence time: %.3f s; durable bandwidth %.3f GB/s = %.2f Gb/s\n",
             durable_seconds,
-            durable_seconds > 0 ? (total_bytes / durable_seconds) / 1e9 : 0.0);
+            durable_seconds > 0 ? (total_bytes / durable_seconds) / 1e9 : 0.0,
+            durable_seconds > 0 ? (total_bytes * 8.0 / durable_seconds) / 1e9 : 0.0);
   }
 
   TS("file close start");

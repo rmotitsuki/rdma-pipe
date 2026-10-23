@@ -110,9 +110,10 @@ static void report_send_progress(int verbose, uint64_t total_bytes,
   double average_mib_s = elapsed > 0.0
       ? (double)total_bytes / elapsed / (1024.0 * 1024.0) : 0.0;
   fprintf(stderr,
-          "Progress: %.2f GiB sent; elapsed %.1f s; %.1f MiB/s (avg %.1f MiB/s)\n",
+          "Progress: %.2f GiB sent; elapsed %.1f s; %.1f Gb/s (avg %.1f Gb/s; %.0f MiB/s)\n",
           (double)total_bytes / (1024.0 * 1024.0 * 1024.0), elapsed,
-          interval_mib_s, average_mib_s);
+          interval_mib_s * 1048576.0 * 8.0 / 1e9,
+          average_mib_s * 1048576.0 * 8.0 / 1e9, average_mib_s);
   *last_report_time = now;
   *last_report_bytes = total_bytes;
 }
@@ -1051,9 +1052,10 @@ int main(int argc, char *argv[]) {
       fprintf(stderr, "Read stall (window open, waiting on file read): %.3f s\n",
               read_stall);
       if (rc.busy_seconds > 0)
-        fprintf(stderr, "Reader: %d threads, %.3f s busy in total, %.2f GB/s per thread\n",
+        fprintf(stderr, "Reader: %d threads, %.3f s busy in total, %.2f GB/s (%.1f Gb/s) per thread\n",
                 nstarted, rc.busy_seconds,
-                (double)rc.chunks_read * buf_size / rc.busy_seconds / 1e9);
+                (double)rc.chunks_read * buf_size / rc.busy_seconds / 1e9,
+                (double)rc.chunks_read * buf_size * 8.0 / rc.busy_seconds / 1e9);
     }
 
     /* End-of-stream sentinel remains ordered after all data sends. */
@@ -1184,8 +1186,11 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "Setup time (process start -> transfer start): %.3f s\n",
             transfer_start - _ts0);
     fprintf(stderr, "Transfer time (elapsed): %.3f s\n", seconds);
-    fprintf(stderr, "Transferred: %llu bytes\n", (unsigned long long)total_bytes);
-    fprintf(stderr, "Bandwidth %.3f GB/s\n", seconds > 0 ? (total_bytes / seconds) / 1e9 : 0.0);
+    fprintf(stderr, "Transferred: %llu bytes (%.2f GiB)\n", (unsigned long long)total_bytes,
+            (double)total_bytes / (1024.0 * 1024.0 * 1024.0));
+    fprintf(stderr, "Bandwidth %.3f GB/s = %.2f Gb/s\n",
+            seconds > 0 ? (total_bytes / seconds) / 1e9 : 0.0,
+            seconds > 0 ? (total_bytes * 8.0 / seconds) / 1e9 : 0.0);
   }
   TS("resource cleanup start");
 
