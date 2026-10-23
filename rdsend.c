@@ -461,11 +461,10 @@ static int qp_timeout_for_rtt(double rtt_ms) {
 }
 
 /* Explicit RDMA_QP_TIMEOUT wins; otherwise derived from the RTT (or 14). */
-static int choose_qp_timeout(int sock, int verbose) {
+static int choose_qp_timeout(double rtt, int verbose) {
   int t = qp_timeout_from_env();
   if (t < 0) return -1;
   const char *env = getenv("RDMA_QP_TIMEOUT");
-  double rtt = tcp_rtt_ms(sock);
   const char *why = "default";
   if (env && *env) why = "RDMA_QP_TIMEOUT";
   else if (auto_enabled() && rtt >= 0) { t = qp_timeout_for_rtt(rtt); why = "auto: >= 2 x TCP RTT"; }
@@ -940,6 +939,8 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "rdsend: TCP QP handshake write failed: %s\n", strerror(errno));
     return 117;
   }
+  /* Read the RTT while the control socket is still open (more samples now). */
+  double ctrl_rtt_ms = tcp_rtt_ms(tcp_sock);
   close(tcp_sock);
 
   // Move QP to RTR
@@ -972,7 +973,7 @@ int main(int argc, char *argv[]) {
   }
 
   // Move QP to RTS
-  int qp_timeout = choose_qp_timeout(tcp_sock, verbose);
+  int qp_timeout = choose_qp_timeout(ctrl_rtt_ms, verbose);
   if (qp_timeout < 0) {
     fprintf(stderr, "rdsend: invalid RDMA_QP_TIMEOUT (expected integer 1..30)\n");
     return EXIT_FAILURE;
