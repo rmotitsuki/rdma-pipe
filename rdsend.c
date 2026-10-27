@@ -52,6 +52,9 @@
 #include <omp.h>
 #include <pthread.h>
 #include <sched.h>
+#include <dirent.h>
+#include <signal.h>
+#include <sys/wait.h>
 
 #include <infiniband/verbs.h>
 
@@ -499,6 +502,214 @@ static double link_gbps_for_socket(int sock, char *ifname, size_t ifname_len) {
   return gbps;
 }
 
+/*
+ * Port rate limit (RDSEND_PORT_RATE_GBPS).
+ *
+ * ConnectX RC QPs have no per-QP hardware rate limit, so pacing is done with
+ * the port's ETS shaper: `dcb maxrate set dev <phys> tc-maxrate 0:R ... 7:R`.
+ * rdsend saves the current per-TC values, applies R to all 8 TCs for the
+ * transfer and restores the saved values on exit, Ctrl+C, SIGTERM or SIGHUP.
+ * After SIGKILL the limit stays; -v prints the command to undo it.
+ */
+#define PR_NTC 8
+static struct {
+  int active;
+  char dcb[256];               /* absolute path of the dcb binary */
+  char dev[64];                /* physical device */
+  char saved[PR_NTC][32];      /* "N:<rate>" as printed by dcb show */
+  char *argv[8 + PR_NTC];
+} port_rate;
+
+/* Follow /sys/class/net/<if>/lower_* down to the device without lowers. */
+static void physical_dev(const char *ifname, char *out, size_t len) {
+  char cur[64];
+  snprintf(cur, sizeof(cur), "%s", ifname);
+  for (int depth = 0; depth < 8; depth++) {
+    char path[160];
+    snprintf(path, sizeof(path), "/sys/class/net/%s", cur);
+    DIR *d = opendir(path);
+    if (!d) break;
+    struct dirent *e;
+    char next[64] = "";
+    while ((e = readdir(d)))
+      if (!strncmp(e->d_name, "lower_", 6)) { snprintf(next, sizeof(next), "%s", e->d_name + 6); break; }
+    closedir(d);
+    if (!next[0]) break;
+    snprintf(cur, sizeof(cur), "%s", next);
+  }
+  snprintf(out, len, "%s", cur);
+}
+
+static double iface_speed_gbps(const char *ifname) {
+  char path[160];
+  snprintf(path, sizeof(path), "/sys/class/net/%s/speed", ifname);
+  FILE *f = fopen(path, "r");
+  long mbps = -1;
+  if (f) { if (fscanf(f, "%ld", &mbps) != 1) mbps = -1; fclose(f); }
+  return mbps > 0 ? mbps / 1000.0 : -1.0;
+}
+
+static int find_dcb(char *out, size_t len) {
+  const char *p = getenv("PATH");
+  char buf[1024];
+  snprintf(buf, sizeof(buf), "%s:/usr/sbin:/sbin:/usr/bin:/bin", p ? p : "");
+  for (char *save = NULL, *dir = strtok_r(buf, ":", &save); dir; dir = strtok_r(NULL, ":", &save)) {
+    snprintf(out, len, "%s/dcb", *dir ? dir : ".");
+    if (access(out, X_OK) == 0) return 0;
+  }
+  return -1;
+}
+
+/* Run argv (argv[0] = absolute path) without a shell; async-signal-safe. */
+static int run_argv(char *const argv[], int quiet) {
+  pid_t pid = fork();
+  if (pid < 0) return -1;
+  if (pid == 0) {
+    if (quiet) { int n = open("/dev/null", O_WRONLY); if (n >= 0) { dup2(n, 1); dup2(n, 2); } }
+    execv(argv[0], argv);
+    _exit(127);
+  }
+  int st;
+  while (waitpid(pid, &st, 0) < 0) if (errno != EINTR) return -1;
+  return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+/* Read "tc-maxrate 0:X 1:Y ..." into out[]; returns number of TCs or -1. */
+static int dcb_maxrate_show(const char *dcb, const char *dev, char out[PR_NTC][32]) {
+  int fds[2];
+  if (pipe(fds)) return -1;
+  pid_t pid = fork();
+  if (pid < 0) { close(fds[0]); close(fds[1]); return -1; }
+  if (pid == 0) {
+    dup2(fds[1], 1);
+    int n = open("/dev/null", O_WRONLY); if (n >= 0) dup2(n, 2);
+    close(fds[0]); close(fds[1]);
+    execl(dcb, dcb, "maxrate", "show", "dev", dev, (char *)NULL);
+    _exit(127);
+  }
+  close(fds[1]);
+  char text[1024];
+  size_t got = 0;
+  ssize_t r;
+  while (got < sizeof(text) - 1 && (r = read(fds[0], text + got, sizeof(text) - 1 - got)) > 0) got += r;
+  text[got] = 0;
+  close(fds[0]);
+  int st;
+  while (waitpid(pid, &st, 0) < 0) if (errno != EINTR) return -1;
+  if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) return -1;
+  char *p = strstr(text, "tc-maxrate");
+  if (!p) return -1;
+  p += strlen("tc-maxrate");
+  int n = 0;
+  for (char *save = NULL, *tok = strtok_r(p, " \t\n", &save); tok && n < PR_NTC;
+       tok = strtok_r(NULL, " \t\n", &save)) {
+    if (tok[0] < '0' || tok[0] > '7' || tok[1] != ':') break;
+    snprintf(out[n++], 32, "%s", tok);
+  }
+  return n;
+}
+
+static int maxrate_is_unlimited(const char *v) {  /* "N:0bit" */
+  const char *r = strchr(v, ':');
+  return r && atof(r + 1) == 0.0;
+}
+
+static void port_rate_restore(void) {
+  if (!port_rate.active) return;
+  port_rate.active = 0;
+  run_argv(port_rate.argv, 1);
+}
+
+static void port_rate_signal(int sig) {
+  port_rate_restore();
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
+static void restore_cmd_string(char *out, size_t len) {
+  size_t o = snprintf(out, len, "dcb maxrate set dev %s tc-maxrate", port_rate.dev);
+  for (int i = 0; i < PR_NTC && o < len; i++) o += snprintf(out + o, len - o, " %s", port_rate.saved[i]);
+}
+
+/*
+ * Apply `gbps` (0 = no limit) to every TC of the physical port behind
+ * `ifname`. Returns 0 on success, -1 on error (message printed).
+ */
+static int port_rate_apply(const char *ifname, double gbps, int verbose) {
+  char dev[64];
+  physical_dev(ifname, dev, sizeof(dev));
+  if (find_dcb(port_rate.dcb, sizeof(port_rate.dcb))) {
+    fprintf(stderr, "rdsend: RDSEND_PORT_RATE_GBPS: dcb not found (install iproute2)\n");
+    return -1;
+  }
+  snprintf(port_rate.dev, sizeof(port_rate.dev), "%s", dev);
+  if (dcb_maxrate_show(port_rate.dcb, dev, port_rate.saved) != PR_NTC) {
+    fprintf(stderr, "rdsend: RDSEND_PORT_RATE_GBPS: cannot read `dcb maxrate show dev %s`\n", dev);
+    return -1;
+  }
+  static char rate[PR_NTC][32], restore[PR_NTC][32];
+  char *set[8 + PR_NTC];
+  int a = 0;
+  set[a++] = port_rate.dcb; set[a++] = "maxrate"; set[a++] = "set";
+  set[a++] = "dev"; set[a++] = port_rate.dev; set[a++] = "tc-maxrate";
+  for (int i = 0; i < PR_NTC; i++) {
+    if (gbps > 0) snprintf(rate[i], sizeof(rate[i]), "%d:%ldmbit", i, (long)(gbps * 1000.0 + 0.5));
+    else snprintf(rate[i], sizeof(rate[i]), "%d:0bit", i);
+    set[a + i] = rate[i];
+  }
+  set[a + PR_NTC] = NULL;
+  /* Restore argv is prepared now so the signal handler only forks/execs. */
+  for (int i = 0; i < a; i++) port_rate.argv[i] = set[i];
+  for (int i = 0; i < PR_NTC; i++) {
+    snprintf(restore[i], sizeof(restore[i]), "%s", port_rate.saved[i]);
+    port_rate.argv[a + i] = restore[i];
+  }
+  port_rate.argv[a + PR_NTC] = NULL;
+
+  char prev[256];
+  restore_cmd_string(prev, sizeof(prev));
+  if (run_argv(set, 0) != 0) {
+    fprintf(stderr, "rdsend: RDSEND_PORT_RATE_GBPS: `dcb maxrate set dev %s` failed (run as root)\n", dev);
+    return -1;
+  }
+  port_rate.active = 1;
+  atexit(port_rate_restore);
+  struct sigaction sa = {0};
+  sa.sa_handler = port_rate_signal;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGINT, &sa, NULL);
+  sigaction(SIGTERM, &sa, NULL);
+  sigaction(SIGHUP, &sa, NULL);
+
+  char now[PR_NTC][32] = {"?"};
+  dcb_maxrate_show(port_rate.dcb, dev, now);  /* report what the port shows now */
+  if (verbose) {
+    if (gbps > 0)
+      fprintf(stderr, "Port rate: %s (via %s) limited to %.2f Gb/s on all TCs (now %s ...)\n",
+              dev, ifname, gbps, now[0]);
+    else
+      fprintf(stderr, "Port rate: %s (via %s) limit removed for this run\n", dev, ifname);
+    fprintf(stderr, "Port rate: previous setting restored at exit; if rdsend is killed (-9), run:\n"
+                    "  sudo %s\n", prev);
+  }
+  return 0;
+}
+
+/* Without RDSEND_PORT_RATE_GBPS: warn if the port has a limit set. */
+static void port_rate_warn_existing(const char *ifname) {
+  char dcb[256], dev[64], cur[PR_NTC][32];
+  if (find_dcb(dcb, sizeof(dcb))) return;
+  physical_dev(ifname, dev, sizeof(dev));
+  int n = dcb_maxrate_show(dcb, dev, cur);
+  for (int i = 0; i < n; i++)
+    if (!maxrate_is_unlimited(cur[i])) {
+      fprintf(stderr, "rdsend: warning: port %s has a rate limit (tc-maxrate %s ...); "
+              "remove it with `dcb maxrate set dev %s tc-maxrate 0:0bit 1:0bit 2:0bit 3:0bit "
+              "4:0bit 5:0bit 6:0bit 7:0bit` or set RDSEND_PORT_RATE_GBPS\n", dev, cur[i], dev);
+      return;
+    }
+}
+
 /* Wait for one completion while using the completion channel safely. */
 static int wait_cq_completion(struct ibv_cq *cq,
                               struct ibv_comp_channel *channel,
@@ -713,8 +924,26 @@ int main(int argc, char *argv[]) {
     double rtt = tcp_rtt_ms(tcp_sock);
     char ifname[64] = "?";
     double gbps = link_gbps_for_socket(tcp_sock, ifname, sizeof(ifname));
-    const char *lg = getenv("RDMA_LINK_GBPS");
     const char *rate_src = "interface speed";
+    if (gbps <= 0 && strcmp(ifname, "?")) {   /* VLANs often report no speed */
+      char phys[64];
+      physical_dev(ifname, phys, sizeof(phys));
+      gbps = iface_speed_gbps(phys);
+    }
+    const char *pr = getenv("RDSEND_PORT_RATE_GBPS");
+    if (pr && *pr) {
+      double prg = atof(pr);
+      if (prg < 0 || !strcmp(ifname, "?")) {
+        fprintf(stderr, "rdsend: RDSEND_PORT_RATE_GBPS=%s: %s\n", pr,
+                prg < 0 ? "must be >= 0 (0 = no limit)" : "cannot find the local interface");
+        return EXIT_FAILURE;
+      }
+      if (port_rate_apply(ifname, prg, verbose)) return EXIT_FAILURE;
+      if (prg > 0) { gbps = prg; rate_src = "RDSEND_PORT_RATE_GBPS"; }
+    } else if (strcmp(ifname, "?")) {
+      port_rate_warn_existing(ifname);
+    }
+    const char *lg = getenv("RDMA_LINK_GBPS");
     if (lg && *lg && atof(lg) > 0) { gbps = atof(lg); rate_src = "RDMA_LINK_GBPS"; }
     else if (gbps <= 0) { gbps = 100.0; rate_src = "assumed; set RDMA_LINK_GBPS"; }
     double bdp = rtt > 0 ? gbps * 1e9 / 8.0 * rtt / 1000.0 : 0.0;
