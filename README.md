@@ -140,6 +140,7 @@ Sender (`rdsend`, sent to the receiver during the handshake):
 | `RDMA_AUTO` | on | Auto-configuration from the control connection's TCP RTT (kernel `TCP_INFO`): the sender sizes the window (`RDMA_BUF_SIZE` × `RDMA_RING_SIZE` ≥ 1.5 × link rate × RTT; 4 MiB × 64 up to ~10 ms at 100G, then 16 MiB chunks) and each side picks `RDMA_QP_TIMEOUT` ≥ 2 × RTT. Explicit variables always win. `RDMA_AUTO=0` restores fixed defaults (32 MiB × 4, timeout 14). |
 | `RDMA_LINK_GBPS` | interface speed | Link rate used by the auto window, when the interface speed is unknown (e.g. some VLAN devices) or a path is slower than the NIC. |
 | `RDMA_QP_TIMEOUT` | auto (14 on a LAN) | RC ACK timeout exponent (4.096 µs × 2^N, 1..30), set on both sides. 14 ≈ 67 ms suits a LAN; on long-haul links use a timeout of at least ~2× the RTT (17 ≈ 537 ms for 115 ms). |
+| `RDSEND_PORT_RATE_GBPS` | unset | Pace the sender with the port's ETS shaper (`dcb maxrate`, all 8 TCs) at this rate for the duration of the run, e.g. `9.4` on a 10 Gb/s WAN path. The physical port behind a VLAN is found automatically; the previous limit is saved and restored at exit, Ctrl+C, SIGTERM or SIGHUP (not after `kill -9`; `-v` prints the undo command). `0` removes any limit for the run. Needs root and `dcb` (iproute2). The limit applies to all traffic of the port while rdsend runs. Also used as the link rate of the auto window unless `RDMA_LINK_GBPS` is set. Without it, rdsend warns if the port already has a limit. |
 | `RDSEND_READ_AHEAD` | ring size, at most 256 MiB | Extra send slots filled ahead of the in-flight window, so file reads overlap with RDMA sends (0..64). |
 | `RDSEND_ZEROCOPY` | `auto` | Send chunks straight from the mapped source file, with no read copy and no reader threads. `auto` = on for tmpfs/shmem sources only; `on` / `off` force it. |
 | `RDSEND_ZEROCOPY_MR` | `odp` | Zero-copy source registration: `odp` (immediate; threads prefetch) or `pinned` (threads populate, then the file is pinned). |
@@ -159,6 +160,11 @@ Receiver (`rdrecv`, zero-copy file path):
 | `RDRECV_PREFAULT` | `ahead` | `ahead`: worker threads allocate destination pages and prefetch NIC translations ahead of the receive window. `upfront`: do it for the whole file before the transfer (reported as setup). `off`: let ODP fault pages in during the transfer. |
 | `RDRECV_PREFAULT_THREADS` | 8 | Prefault worker threads. |
 | `RDRECV_PREFAULT_AHEAD` | 64 | Maximum chunks prefaulted beyond the last completed one (`0` = unlimited). |
+
+Pacing below the bottleneck: on a long path whose bottleneck drops (rather than
+marks) excess traffic, RC go-back-N retransmission collapses throughput. Pace a
+few percent below the nominal rate: on a 10 Gb/s, 284 ms path,
+`RDSEND_PORT_RATE_GBPS=9.4` sustained 9.25 Gb/s, while 9.5 was unstable.
 
 With `-v`, both sides report the same transfer interval (from key
 verification to the end-of-stream sentinel); the receiver additionally
