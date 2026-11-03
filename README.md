@@ -6,7 +6,9 @@ Utilities to transfer files over RDMA networks, currently focused on RoCEv2.
 
 This working copy is derived from [kig/rdma-pipe](https://github.com/kig/rdma-pipe), originally authored by **Ilmari Heikkinen**, and incorporates the RoCEv2/`libibverbs` implementation maintained in the [yuhong-zhong/rdma-pipe fork](https://github.com/yuhong-zhong/rdma-pipe). Credit and copyright notices for the upstream work remain applicable; see [`LICENSE`](LICENSE).
 
-The SC26-RDMA working copy adds further local changes, including diagnostic/error reporting, argument validation, and helpers for complete TCP reads/writes. These local changes have not yet undergone a complete code audit or a comprehensive test suite. The fact that a test transfer succeeded is not a claim that all code paths are correct.
+The SC26-RDMA working copy adds further local changes, including diagnostic/error reporting, argument validation, and helpers for complete TCP reads/writes. The changes made in this working copy (features, optimizations, fixes and measured results, compared with the original and the fork) are described in [`CHANGES.md`](CHANGES.md).
+
+These local changes have not yet undergone a complete code audit or a comprehensive test suite. The fact that a test transfer succeeded is not a claim that all code paths are correct.
 
 **Compatibility note:** the yuhong-zhong fork changes the low-level implementation and connection handshake compared with the original upstream version. Do not assume protocol or command-line compatibility between these versions. The low-level tools use a TCP connection for the QP handshake and `libibverbs` for RDMA data transfer; this implementation does not require `ibacm` for that handshake.
 
@@ -127,7 +129,7 @@ Start `rdrecv` first, then run `rdsend`. The sender and receiver must use the sa
 
 The commands are best executed with rdrecv first, so that rdsend can connect on the first attempt. 
 
-If rdrecv is not up, rdsend tries to connect for ~10 seconds before timing out.
+If rdrecv is not up, rdsend tries to connect for ~3 seconds (300 attempts, 10 ms apart) before giving up.
 
 ### Tuning (environment variables)
 
@@ -135,8 +137,8 @@ Sender (`rdsend`, sent to the receiver during the handshake):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `RDMA_BUF_SIZE` | 32 | Chunk size in MiB |
-| `RDMA_RING_SIZE` | 4 | Chunks in flight (2..256). With smaller chunks (e.g. `RDMA_BUF_SIZE=4`) use a deeper window. |
+| `RDMA_BUF_SIZE` | auto (4 on a LAN; 32 with `RDMA_AUTO=0`) | Chunk size in MiB |
+| `RDMA_RING_SIZE` | auto (64 on a LAN; 4 with `RDMA_AUTO=0`) | Chunks in flight (2..256). With smaller chunks (e.g. `RDMA_BUF_SIZE=4`) use a deeper window. |
 | `RDMA_AUTO` | on | Auto-configuration from the control connection's TCP RTT (kernel `TCP_INFO`): the sender sizes the window (`RDMA_BUF_SIZE` × `RDMA_RING_SIZE` ≥ 1.5 × link rate × RTT; 4 MiB × 64 up to ~10 ms at 100G, then 16 MiB chunks) and each side picks `RDMA_QP_TIMEOUT` ≥ 2 × RTT. Explicit variables always win. `RDMA_AUTO=0` restores fixed defaults (32 MiB × 4, timeout 14). |
 | `RDMA_LINK_GBPS` | interface speed | Link rate used by the auto window, when the interface speed is unknown (e.g. some VLAN devices) or a path is slower than the NIC. |
 | `RDMA_QP_TIMEOUT` | auto (14 on a LAN) | RC ACK timeout exponent (4.096 µs × 2^N, 1..30), set on both sides. 14 ≈ 67 ms suits a LAN; on long-haul links use a timeout of at least ~2× the RTT (17 ≈ 537 ms for 115 ms). |
