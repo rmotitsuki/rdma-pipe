@@ -39,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -125,8 +126,26 @@ void usage() {
   fprintf(stderr, "USAGE: rdsend [-v] <server> <port> <key> [filename]\n");
 }
 
-// Returns 1 if GID at (devname, port, gidx) is of type "RoCE v2"
-static int gid_is_roce_v2(const char *devname, uint8_t port, int gidx) {
+// Returns 1 if GID at (devname, port, gidx) is of the selected RoCE type
+/*
+ * RoCE version of the GID to use (RDMA_ROCE_VERSION = 2 (default) | 1).
+ * RoCE v1 is plain Ethernet (no IP/UDP), for point-to-point L2 paths; both
+ * sides must use the same version.
+ */
+static const char *roce_gid_type(void) {
+  static const char *type = NULL;
+  if (type) return type;
+  const char *v = getenv("RDMA_ROCE_VERSION");
+  if (!v || !*v || !strcmp(v, "2") || !strcasecmp(v, "v2")) type = "RoCE v2";
+  else if (!strcmp(v, "1") || !strcasecmp(v, "v1")) type = "IB/RoCE v1";
+  else {
+    fprintf(stderr, "invalid RDMA_ROCE_VERSION='%s' (expected 1 or 2)\n", v);
+    exit(EXIT_FAILURE);
+  }
+  return type;
+}
+
+static int gid_type_ok(const char *devname, uint8_t port, int gidx) {
   char path[256];
   char typebuf[32] = {};
   snprintf(path, sizeof(path),
@@ -138,7 +157,7 @@ static int gid_is_roce_v2(const char *devname, uint8_t port, int gidx) {
   fclose(f);
   // strip trailing newline
   typebuf[strcspn(typebuf, "\n")] = '\0';
-  return strcmp(typebuf, "RoCE v2") == 0;
+  return strcmp(typebuf, roce_gid_type()) == 0;
 }
 
 // Find the ibv_context and port for the device whose RoCEv2 GID matches the
@@ -163,7 +182,7 @@ struct ibv_context *find_rdma_device(const char *target_ip, uint8_t *port_out,
   close(sock);
   uint32_t local_ip = local.sin_addr.s_addr; // network byte order
 
-  if (verbose) fprintf(stderr, "DEBUG: local_ip = %08x (looking for RoCEv2 GID)\n", local_ip);
+  if (verbose) fprintf(stderr, "DEBUG: local_ip = %08x (looking for a %s GID)\n", local_ip, roce_gid_type());
 
   int num_devices;
   struct ibv_device **devlist = ibv_get_device_list(&num_devices);
@@ -190,13 +209,13 @@ struct ibv_context *find_rdma_device(const char *target_ip, uint8_t *port_out,
         if (ibv_query_gid(ctx, port, gidx, &gid)) continue;
         // RoCEv2 IPv4-mapped GID: bytes 0-9 are zero, 10-11 are 0xFF,
         // bytes 12-15 are the IPv4 address.
-        int is_roce_v2 = gid_is_roce_v2(ibv_get_device_name(devlist[i]), port, gidx);
+        int is_type = gid_type_ok(ibv_get_device_name(devlist[i]), port, gidx);
         if (gid.raw[10] == 0xFF && gid.raw[11] == 0xFF) {
           uint32_t gid_ip;
           memcpy(&gid_ip, &gid.raw[12], 4);
-          if (verbose) fprintf(stderr, "DEBUG:  gid[%d]: ip=%08x local=%08x roce_v2=%d\n",
-                  gidx, gid_ip, local_ip, is_roce_v2);
-          if (gid_ip == local_ip && is_roce_v2) {
+          if (verbose) fprintf(stderr, "DEBUG:  gid[%d]: ip=%08x local=%08x type_ok=%d\n",
+                  gidx, gid_ip, local_ip, is_type);
+          if (gid_ip == local_ip && is_type) {
             *port_out = port;
             *gid_idx_out = gidx;
             *gid_out = gid;
@@ -809,9 +828,12 @@ int main(int argc, char *argv[]) {
   ctx = find_rdma_device(host, &port_num, &gid_idx, &local_gid, verbose);
   TS("RDMA device discovery done");
   if (!ctx) {
-    fprintf(stderr, "rdsend: no active RoCEv2 GID matches the interface used to reach %s; check link state, IP assignment, and GID table\n", host);
+    fprintf(stderr, "rdsend: no active %s GID matches the interface used to reach %s; check link state, IP assignment, GID table and RDMA_ROCE_VERSION\n", roce_gid_type(), host);
     return 101;
   }
+  if (verbose)
+    fprintf(stderr, "RoCE: %s, %s port %u, GID index %d\n", roce_gid_type(),
+            ibv_get_device_name(ctx->device), port_num, gid_idx);
 
   pd = ibv_alloc_pd(ctx);
   if (!pd) { fprintf(stderr, "rdsend: ibv_alloc_pd failed: %s\n", strerror(errno)); return 109; }
